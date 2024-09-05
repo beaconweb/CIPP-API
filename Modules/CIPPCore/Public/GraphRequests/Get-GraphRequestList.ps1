@@ -48,7 +48,7 @@ function Get-GraphRequestList {
     #>
     [CmdletBinding()]
     Param(
-        [string]$TenantFilter = $env:TenantId,
+        [string]$TenantFilter = $env:TenantID,
         [Parameter(Mandatory = $true)]
         [string]$Endpoint,
         [hashtable]$Parameters = @{},
@@ -176,10 +176,12 @@ function Get-GraphRequestList {
                         }
 
                         try {
+                            $DefaultDomainName = $_.defaultDomainName
+                            Write-Host "Default domain name is $DefaultDomainName"
                             Get-GraphRequestList @GraphRequestParams | Select-Object *, @{l = 'Tenant'; e = { $_.defaultDomainName } }, @{l = 'CippStatus'; e = { 'Good' } }
                         } catch {
                             [PSCustomObject]@{
-                                Tenant     = $_.defaultDomainName
+                                Tenant     = $DefaultDomainName
                                 CippStatus = "Could not connect to tenant. $($_.Exception.message)"
                             }
                         }
@@ -292,7 +294,7 @@ function Get-GraphRequestList {
                                     method = 'GET'
                                 }
                             }
-                            $TenantInfo = New-GraphBulkRequest -Requests @($ReverseLookupRequests) -tenantid $env:TenantId -NoAuthCheck $true -asapp $true
+                            $TenantInfo = New-GraphBulkRequest -Requests @($ReverseLookupRequests) -tenantid $env:TenantID -NoAuthCheck $true -asapp $true
 
                             $GraphRequestResults | Select-Object @{n = 'TenantInfo'; e = { Get-GraphBulkResultByID -Results @($TenantInfo) -ID $_.$ReverseTenantLookupProperty } }, *
 
