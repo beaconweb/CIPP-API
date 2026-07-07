@@ -11,6 +11,8 @@ function Start-UserTasksOrchestrator {
         $TaskId = $null
     )
 
+    try { [CIPP.TestDataCache]::ClearExpired() } catch { Write-Information "TestDataCache clearexpired skipped: $($_.Exception.Message)" }
+
     $Table = Get-CippTable -tablename 'ScheduledTasks'
 
     if ($TaskId) {
@@ -26,10 +28,10 @@ function Start-UserTasksOrchestrator {
         }
     } else {
         $4HoursAgo = (Get-Date).AddHours(-4).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $24HoursAgo = (Get-Date).AddHours(-24).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        # Pending = orchestrator queued, Running = actively executing
-        # Pick up: Planned, Failed-Planned, stuck Pending (>24hr), or stuck Running (>4hr for large AllTenants tasks)
-        $Filter = "PartitionKey eq 'ScheduledTask' and (TaskState eq 'Planned' or TaskState eq 'Failed - Planned' or (TaskState eq 'Pending' and Timestamp lt datetime'$24HoursAgo') or (TaskState eq 'Running' and Timestamp lt datetime'$4HoursAgo') or (TaskState eq 'Processing' and Timestamp lt datetime'$4HoursAgo'))"
+        $1HourAgo = (Get-Date).AddHours(-1).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        # Pending = orchestrator claimed but executor not yet started, Running = actively executing
+        # Pick up: Planned, Failed-Planned, stuck Pending (>1hr - orphaned claim), or stuck Running/Processing (>4hr for large AllTenants tasks)
+        $Filter = "PartitionKey eq 'ScheduledTask' and (TaskState eq 'Planned' or TaskState eq 'Failed - Planned' or (TaskState eq 'Pending' and Timestamp lt datetime'$1HourAgo') or (TaskState eq 'Running' and Timestamp lt datetime'$4HoursAgo') or (TaskState eq 'Processing' and Timestamp lt datetime'$4HoursAgo'))"
         $tasks = Get-CIPPAzDataTableEntity @Table -Filter $Filter
     }
 
@@ -73,7 +75,36 @@ function Start-UserTasksOrchestrator {
                 }
 
                 # Cache Get-Command result to avoid repeated expensive reflection calls
-                $CommandInfo = Get-Command $task.Command
+                $CommandInfo = Get-Command -Name $task.Command -ErrorAction SilentlyContinue
+                if (-not $CommandInfo) {
+                    # Resolve the required module from standardised command name patterns
+                    $ModuleToImport = switch -Wildcard ($task.Command) {
+                        'Invoke-CIPPStandard*' { 'CIPPStandards' }
+                        'Get-CIPPAlert*' { 'CIPPAlerts' }
+                        default { $null }
+                    }
+
+                    if ($ModuleToImport) {
+                        Write-Information "Command '$($task.Command)' not found. Attempting import of '$ModuleToImport' module."
+                        $ImportedModule = $false
+                        try {
+                            if (-not (Get-Module -Name $ModuleToImport)) {
+                                Import-Module $ModuleToImport -ErrorAction Stop
+                                $ImportedModule = $true
+                                Write-Information "Imported module '$ModuleToImport' for command resolution retry."
+                            }
+                            $CommandInfo = Get-Command -Name $task.Command -ErrorAction Stop
+                        } catch {
+                            throw "Unable to resolve command '$($task.Command)' for scheduled task '$($task.Name)' after importing '$ModuleToImport'. $($_.Exception.Message)"
+                        } finally {
+                            if ($ImportedModule) {
+                                Remove-Module $ModuleToImport -ErrorAction SilentlyContinue
+                            }
+                        }
+                    } else {
+                        throw "Command '$($task.Command)' not found and no module could be resolved from the command name for scheduled task '$($task.Name)'."
+                    }
+                }
                 $HasTenantFilter = $CommandInfo.Parameters.ContainsKey('TenantFilter')
 
                 $ScheduledCommand = [pscustomobject]@{
