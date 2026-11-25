@@ -37,12 +37,6 @@ function Get-CIPPStandards {
             $_.runManually -eq $runManually
         }
 
-    if ($TemplateId -ne '*' -and ![string]::IsNullOrEmpty($TemplateId)) {
-        $Templates = $Templates | Where-Object {
-            $_.GUID -like $TemplateId
-        }
-    }
-
     # 1.5. Expand templates that contain TemplateList-Tags into multiple standards
     $ExpandedTemplates = foreach ($Template in $Templates) {
         Write-Information "Template $($Template.templateName) ($($Template.GUID)) processing..."
@@ -73,11 +67,13 @@ function Get-CIPPStandards {
                                 $TemplateLabel = if ($TemplateJSON.displayName) { $TemplateJSON.displayName } else { "$($TemplateItem.RowKey)" }
                                 $NewItem = $Item.PSObject.Copy()
                                 $NewItem.PSObject.Properties.Remove('TemplateList-Tags')
-                                $NewItem | Add-Member -NotePropertyName TemplateList -NotePropertyValue ([pscustomobject]@{
-                                        label = $TemplateLabel
-                                        value = "$($TemplateItem.RowKey)"
+                                $NewItem | Add-Member -NotePropertyMembers ([ordered]@{
+                                        TemplateList = ([pscustomobject]@{
+                                                label = $TemplateLabel
+                                                value = "$($TemplateItem.RowKey)"
+                                            })
+                                        TemplateId   = $Template.GUID
                                     }) -Force
-                                $NewItem | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
                                 $NewItem
                             }
                         } else {
@@ -105,11 +101,13 @@ function Get-CIPPStandards {
                         $TemplateLabel = if ($TemplateJSON.displayName) { $TemplateJSON.displayName } else { "$($TemplateItem.RowKey)" }
                         $NewItem = $StandardValue.PSObject.Copy()
                         $NewItem.PSObject.Properties.Remove('TemplateList-Tags')
-                        $NewItem | Add-Member -NotePropertyName TemplateList -NotePropertyValue ([pscustomobject]@{
-                                label = $TemplateLabel
-                                value = "$($TemplateItem.RowKey)"
+                        $NewItem | Add-Member -NotePropertyMembers ([ordered]@{
+                                TemplateList = ([pscustomobject]@{
+                                        label = $TemplateLabel
+                                        value = "$($TemplateItem.RowKey)"
+                                    })
+                                TemplateId   = $Template.GUID
                             }) -Force
-                        $NewItem | Add-Member -NotePropertyName TemplateId -NotePropertyValue $Template.GUID -Force
                         $NewItem
                     }
                     $ExpandedStandards[$StandardName] = $NewArray
@@ -350,7 +348,12 @@ function Get-CIPPStandards {
                             $TemplateKey = if ($CurrentStandard.TemplateList.value) { $CurrentStandard.TemplateList.value } else { '' }
                             $Key = "$StandardName|$TemplateKey"
 
-                            $ComputedStandards[$Key] = $CurrentStandard
+                            # Single-instance *Template standards (e.g. GroupTemplate) accumulate across AllTenants templates like the other tiers.
+                            if ($ComputedStandards.ContainsKey($Key)) {
+                                $ComputedStandards[$Key] = Merge-CippStandards -Existing $ComputedStandards[$Key] -New $CurrentStandard -StandardName $StandardName
+                            } else {
+                                $ComputedStandards[$Key] = $CurrentStandard
+                            }
                         }
                     }
                 }

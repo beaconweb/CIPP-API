@@ -21,12 +21,14 @@ function Get-CIPPAlertQuotaUsed {
         $AlertData = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/reports/getMailboxUsageDetail(period='D7')?`$format=application/json&`$top=999" -tenantid $TenantFilter
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        Write-LogMessage -API 'Alerts' -tenant $TenantFilter -message "Mailbox quota Alert: Unable to get mailbox usage: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+        $Severity = if (Test-CippTransientError -Message $ErrorMessage.NormalizedError) { 'Warning' } else { 'Error' }
+        Write-LogMessage -API 'Alerts' -tenant $TenantFilter -message "Mailbox quota Alert: Unable to get mailbox usage: $($ErrorMessage.NormalizedError)" -sev $Severity -LogData $ErrorMessage
         return
     }
 
     $OverQuota = $AlertData | ForEach-Object {
-        if (!$_.StorageUsedInBytes -or !$_.prohibitSendReceiveQuotaInBytes) { return }
+        if (!$_.storageUsedInBytes -or !$_.prohibitSendReceiveQuotaInBytes) { return }
+        if ("$($_.isDeleted)" -eq 'True') { return }
         if ($Excluded -contains $_.userPrincipalName.ToLower()) { return }
         # Report returns 'User'/'Shared' or 'UserMailbox'/'SharedMailbox' depending on tenant; normalize before matching
         if ($MailboxTypes.Count -gt 0 -and ($_.recipientType -replace 'Mailbox$') -notin $MailboxTypes) { return }
@@ -34,6 +36,7 @@ function Get-CIPPAlertQuotaUsed {
         if ($UsagePercent -ge $Threshold) {
             [PSCustomObject]@{
                 Message                         = "$($_.userPrincipalName): Mailbox is more than $($Threshold)% full. Mailbox is $UsagePercent% full"
+                Id                              = $_.userPrincipalName # stable identity; Message carries live usage %
                 Owner                           = $_.userPrincipalName
                 RecipientType                   = $_.recipientType
                 UsagePercent                    = $UsagePercent
@@ -43,7 +46,5 @@ function Get-CIPPAlertQuotaUsed {
             }
         }
     }
-    if ($OverQuota) {
-        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $OverQuota
-    }
+    Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $OverQuota
 }

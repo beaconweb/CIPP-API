@@ -11,7 +11,7 @@ function Get-CIPPAlertInactiveSharePointSites {
         $TenantFilter
     )
 
-    $HasSharePoint = Test-CIPPStandardLicense -StandardName 'InactiveSharePointSites' -TenantFilter $TenantFilter -Preset SharePoint
+    $HasSharePoint = Test-CIPPStandardLicense -StandardName 'InactiveSharePointSites' -TenantFilter $TenantFilter -Preset SharePoint -SkipLog
     if (-not $HasSharePoint) {
         return
     }
@@ -88,9 +88,7 @@ function Get-CIPPAlertInactiveSharePointSites {
             }
         }
 
-        if ($AlertData) {
-            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-        }
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-AlertMessage -message "Inactive SharePoint sites alert failed: $($ErrorMessage.NormalizedError)" -tenant $TenantFilter -LogData $ErrorMessage

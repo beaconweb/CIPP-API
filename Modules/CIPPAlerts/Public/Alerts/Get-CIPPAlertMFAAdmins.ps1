@@ -13,7 +13,7 @@ function Get-CIPPAlertMFAAdmins {
     try {
         $CAPolicies = (New-GraphGetRequest -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$top=999' -tenantid $TenantFilter -ErrorAction Stop)
         foreach ($Policy in $CAPolicies) {
-            if ($policy.grantControls.customAuthenticationFactors -eq 'RequireDuoMfa') {
+            if ($Policy.state -eq 'enabled' -and $policy.grantControls.customAuthenticationFactors -eq 'RequireDuoMfa') {
                 $DuoActive = $true
             }
         }
@@ -75,9 +75,7 @@ function Get-CIPPAlertMFAAdmins {
                     })
             }
 
-            if ($AlertData.Count -gt 0) {
-                Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-            }
+            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
         } else {
             Write-LogMessage -message 'Potentially using Duo for MFA, could not check MFA status for Admins with 100% accuracy' -API 'MFA Alerts - Informational' -tenant $TenantFilter -sev Info
         }

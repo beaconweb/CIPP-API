@@ -11,7 +11,8 @@ function Add-CIPPDelegatedPermission {
     $ApplicationId = $ApplicationId ?? $env:ApplicationID
     Set-Location (Get-Item $PSScriptRoot).FullName
 
-    if ($ApplicationId -eq $env:ApplicationID -and $TenantFilter -eq $env:TenantID) {
+    $IsPartnerTenant = $TenantFilter -eq 'PartnerTenant' -or $TenantFilter -eq $env:TenantID -or [bool](Get-CIPPPartnerTenant -PartnerTenantId $TenantFilter)
+    if ($ApplicationId -eq $env:ApplicationID -and $IsPartnerTenant) {
         #return @('Cannot modify delgated permissions for CIPP-SAM on partner tenant')
         $RequiredResourceAccess = 'CIPPDefaults'
     }
@@ -36,7 +37,7 @@ function Add-CIPPDelegatedPermission {
             $RequiredResourceAccess.Add($Resource)
         }
 
-        if ($TenantFilter -eq $env:TenantID -or $TenantFilter -eq 'PartnerTenant') {
+        if ($IsPartnerTenant) {
             $RequiredResourceAccess = $RequiredResourceAccess + ($AdditionalPermissions | Where-Object { $RequiredResourceAccess.resourceAppId -notcontains $_.resourceAppId })
         } else {
             # remove the partner center permission if not pushing to partner tenant
@@ -73,8 +74,15 @@ function Add-CIPPDelegatedPermission {
     $Results = [System.Collections.Generic.List[string]]::new()
 
     $ourSVCPrincipal = $ServicePrincipalList | Where-Object -Property AppId -EQ $ApplicationId | Select-Object -First 1
-    if (!$ourSVCPrincipal) {
-        $ourSvcPrincipal = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$ApplicationId')?`$select=appId,id,displayName" -tenantid $TenantFilter -skipTokenCache $true -NoAuthCheck $true
+    foreach ($Delay in 0, 2, 4, 8, 16) {
+        if ($ourSVCPrincipal) { break }
+        # A service principal created moments ago can take a while to replicate.
+        Start-Sleep -Seconds $Delay
+        try {
+            $ourSVCPrincipal = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$ApplicationId')?`$select=appId,id,displayName" -tenantid $TenantFilter -skipTokenCache $true -NoAuthCheck $true
+        } catch {
+            Write-Information "Service principal for $ApplicationId not found in $TenantFilter yet: $($_.Exception.Message)"
+        }
     }
     if (!$ourSVCPrincipal) {
         $Results.Add("Failed to find service principal for application $ApplicationId in tenant $TenantFilter")
@@ -82,6 +90,7 @@ function Add-CIPPDelegatedPermission {
     }
 
     $CurrentDelegatedScopes = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals/$($ourSVCPrincipal.id)/oauth2PermissionGrants" -skipTokenCache $true -tenantid $TenantFilter -NoAuthCheck $true
+    $ChangedResources = [System.Collections.Generic.List[string]]::new()
 
     foreach ($App in $RequiredResourceAccess) {
         if (!$App) {
@@ -134,6 +143,7 @@ function Add-CIPPDelegatedPermission {
                 } | ConvertTo-Json -Compress
                 $CreateRequest = New-GraphPOSTRequest -uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants' -tenantid $TenantFilter -body $Createbody -type POST -NoAuthCheck $true
                 $Results.add("Successfully added permissions for $($svcPrincipalId.displayName)")
+                $ChangedResources.Add("$($svcPrincipalId.displayName) (added)")
             } catch {
                 $Results.add("Failed to add permissions for $($svcPrincipalId.displayName): $(Get-NormalizedError -message $_.Exception.Message)")
                 continue
@@ -180,8 +190,19 @@ function Add-CIPPDelegatedPermission {
             # Added permissions
             $Added = ($Compare | Where-Object { $_.SideIndicator -eq '=>' }).InputObject -join ' '
             $Removed = ($Compare | Where-Object { $_.SideIndicator -eq '<=' }).InputObject -join ' '
+            $AddedCount = @(($Compare | Where-Object { $_.SideIndicator -eq '=>' })).Count
+            $RemovedCount = @(($Compare | Where-Object { $_.SideIndicator -eq '<=' })).Count
             $Results.add("Successfully updated permissions for $($svcPrincipalId.displayName). $(if ($Added) { "Added: $Added"}) $(if ($Removed) { "Removed: $Removed"})")
+            $ChangedResources.Add("$($svcPrincipalId.displayName) (updated: +$AddedCount/-$RemovedCount)")
         }
+    }
+
+    if ($ChangedResources.Count -gt 0) {
+        Write-LogMessage -API 'Add-CIPPDelegatedPermission' -tenant $TenantFilter -message "Updated delegated permissions for $($ourSVCPrincipal.displayName): $($ChangedResources -join '; ')" -Sev 'Info'
+    }
+    $Failures = @($Results | Where-Object { $_ -match '^Failed to' })
+    if ($Failures.Count -gt 0) {
+        Write-LogMessage -API 'Add-CIPPDelegatedPermission' -tenant $TenantFilter -message "Failed during delegated permission update for $($ourSVCPrincipal.displayName): $($Failures.Count) error(s)" -Sev 'Warning' -LogData @{ Failures = $Failures }
     }
 
     return $Results

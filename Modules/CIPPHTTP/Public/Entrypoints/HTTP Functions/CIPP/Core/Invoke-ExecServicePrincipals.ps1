@@ -7,11 +7,26 @@ function Invoke-ExecServicePrincipals {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
     $TenantFilter = $env:TenantID
 
     $Success = $true
+    $StatusCode = [HttpStatusCode]::OK
 
     $Action = $Request.Query.Action ?? 'Default'
+
+    # These values are placed in the Graph URL, so only a GUID or a plain field list is accepted.
+    $Invalid = if ($Request.Query.AppId -and -not (Test-IsGuid -String $Request.Query.AppId)) { 'AppId' }
+    elseif ($Request.Query.Id -and -not (Test-IsGuid -String $Request.Query.Id)) { 'Id' }
+    elseif ($Request.Query.Select -and $Request.Query.Select -notmatch '^[A-Za-z0-9_,.]+\z') { 'Select' }
+    if ($Invalid) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = @{ Results = "Invalid $Invalid"; Metadata = @{ Action = $Action; Success = $false } } | ConvertTo-Json -Compress
+            })
+    }
+
     try {
         switch ($Request.Query.Action) {
             'Create' {
@@ -30,6 +45,8 @@ function Invoke-ExecServicePrincipals {
                     if ($BlockList -contains $Request.Query.AppId) {
                         $Results = 'Service Principal creation is blocked for this AppId'
                         $Success = $false
+                        $StatusCode = [HttpStatusCode]::BadRequest
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev 'Error'
                     } else {
                         $Body = @{
                             'appId' = $Request.Query.AppId
@@ -37,23 +54,29 @@ function Invoke-ExecServicePrincipals {
                         try {
                             $ServicePrincipal = New-GraphPostRequest -Uri 'https://graph.microsoft.com/beta/servicePrincipals' -tenantid $TenantFilter -type POST -body $Body -NoAuthCheck $true
                             $Results = "Created service principal for $($ServicePrincipal.displayName) ($($ServicePrincipal.appId))"
+                            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev 'Info'
                         } catch {
-                            $Results = "Unable to create service principal: $($_.Exception.Message)"
+                            $ErrorMessage = Get-CippException -Exception $_
+                            $Results = "Unable to create service principal: $($ErrorMessage.NormalizedError)"
                             $Success = $false
+                            $StatusCode = [HttpStatusCode]::InternalServerError
+                            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev 'Error' -LogData $ErrorMessage
                         }
                     }
                 } else {
                     $Results = 'Invalid AppId'
                     $Success = $false
+                    $StatusCode = [HttpStatusCode]::BadRequest
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Results -Sev 'Error'
                 }
             }
             default {
                 if ($Request.Query.AppId) {
                     $Action = 'Get'
-                    $Results = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$($Request.Query.AppId)')" -tenantid $TenantFilter -NoAuthCheck $true
+                    $Results = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$([guid]$Request.Query.AppId)')" -tenantid $TenantFilter -NoAuthCheck $true
                 } elseif ($Request.Query.Id) {
                     $Action = 'Get'
-                    $Results = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($Request.Query.Id)" -tenantid $TenantFilter -NoAuthCheck $true
+                    $Results = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/servicePrincipals/$([guid]$Request.Query.Id)" -tenantid $TenantFilter -NoAuthCheck $true
                 } else {
                     $Action = 'List'
                     $Uri = 'https://graph.microsoft.com/beta/servicePrincipals?$top=999&$orderby=displayName&$count=true'
@@ -66,8 +89,13 @@ function Invoke-ExecServicePrincipals {
             }
         }
     } catch {
-        $Results = $_.Exception.Message
+        $ErrorMessage = Get-CippException -Exception $_
+        $Results = $ErrorMessage.NormalizedError
         $Success = $false
+        $StatusCode = [HttpStatusCode]::InternalServerError
+        if ($Action -eq 'Create') {
+            Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Failed to create service principal: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+        }
     }
 
     $Metadata = @{
@@ -90,7 +118,7 @@ function Invoke-ExecServicePrincipals {
 
     $Json = $Body | ConvertTo-Json -Depth 10 -Compress
     return ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
+            StatusCode = $StatusCode
             Body       = $Json
         })
 }

@@ -20,6 +20,9 @@ Function Invoke-ListSiteMembers {
     $SiteId = $Request.Query.SiteId
     $SiteUrl = $Request.Query.SiteUrl
     $Filter = $Request.Query.Filter
+    if (-not $SiteId -and -not $SiteUrl) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = 'SiteId or SiteUrl is required' } })
+    }
 
     # A SharePoint user entity is a guest/external identity when either guest flag is set or
     # the claims login carries the external-user or spo-guest marker.
@@ -34,10 +37,10 @@ Function Invoke-ListSiteMembers {
 
         $Members = [System.Collections.Generic.List[object]]::new()
         try {
-            $SharePointInfo = Get-SharePointAdminLink -Public $false -tenantFilter $TenantFilter
-            $Scope = "$($SharePointInfo.SharePointUrl)/.default"
-            $JsonAccept = @{ Accept = 'application/json;odata=nometadata' }
-            $BaseUri = "$($SiteUrl.TrimEnd('/'))/_api"
+            $RestContext = Resolve-CIPPSharePointRestContext -TenantFilter $TenantFilter -SiteUrl $SiteUrl
+            $Scope = $RestContext.Scope
+            $JsonAccept = $RestContext.Headers
+            $BaseUri = $RestContext.BaseUri
 
             $RoleGroups = [ordered]@{
                 'Owners'   = 'associatedownergroup'
@@ -152,7 +155,7 @@ Function Invoke-ListSiteMembers {
         $StatusCode = [HttpStatusCode]::OK
         $Body = @($Members)
     } catch {
-        $StatusCode = [HttpStatusCode]::Forbidden
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $Body = Get-NormalizedError -Message $_.Exception.Message
     }
 

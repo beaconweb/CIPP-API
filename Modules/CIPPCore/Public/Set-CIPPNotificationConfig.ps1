@@ -16,11 +16,11 @@ function Set-CIPPNotificationConfig {
         $logsToInclude,
         $sendtoIntegration,
         $sev,
-        [boolean]$UseStandardizedSchema,
-        $APIName = 'Set Notification Config'
+        [boolean]$UseStandardizedSchema
     )
 
     try {
+        if (-not [string]::IsNullOrWhiteSpace($webhook)) { Assert-CIPPWebhookDestination -Uri $webhook }
         $Table = Get-CIPPTable -TableName SchedulerConfig
         $ExistingConfig = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'CippNotifications' and RowKey eq 'CippNotifications'"
 

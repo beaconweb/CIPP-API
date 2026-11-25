@@ -29,6 +29,17 @@ function Invoke-AddAlert {
                         Body       = @{ error = "Invalid property name: $($condition.Property.label)" }
                     })
             }
+            # Reject now what the condition builder would refuse when the rule fires
+            $HasValue = if ($condition.Input.value -is [array]) { @($condition.Input.value).Count -gt 0 } else { -not [string]::IsNullOrEmpty([string]$condition.Input.value) }
+            if ($HasValue) {
+                $Sanitized = try { Test-CIPPConditionFilter -Condition $condition -WarningAction SilentlyContinue } catch { $null }
+                if ($null -eq $Sanitized) {
+                    return ([HttpResponseContext]@{
+                            StatusCode = [HttpStatusCode]::BadRequest
+                            Body       = @{ error = "Invalid value for condition on property: $($condition.Property.label)" }
+                        })
+                }
+            }
         }
 
         $Tenants = $Request.Body.tenantFilter
@@ -36,19 +47,38 @@ function Invoke-AddAlert {
         $TenantsJson = $Tenants | ConvertTo-Json -Compress -Depth 10 | Out-String
         $excludedTenantsJson = $Request.Body.excludedTenants | ConvertTo-Json -Compress -Depth 10 | Out-String
         $Actions = $Request.Body.actions | ConvertTo-Json -Compress -Depth 10 | Out-String
+        # Which containment actions the 'becremediate' action runs (ListBECRemediationActions ids); empty = the default six.
+        $BecActions = @($Request.Body.becActions | ForEach-Object { if ($_ -and $_.PSObject.Properties['value']) { $_.value } else { $_ } } | Where-Object { $_ })
         $RowKey = $Request.Body.RowKey ? $Request.Body.RowKey : (New-Guid).ToString()
         $CompleteObject = @{
-            Tenants         = [string]$TenantsJson
-            excludedTenants = [string]$excludedTenantsJson
-            Conditions      = [string]$Conditions
-            Actions         = [string]$Actions
-            type            = $Request.Body.logbook.value
-            RowKey          = $RowKey
-            PartitionKey    = 'Webhookv2'
-            AlertComment    = [string]$Request.Body.AlertComment
-            CustomSubject   = [string]$Request.Body.CustomSubject
+            Tenants           = [string]$TenantsJson
+            excludedTenants   = [string]$excludedTenantsJson
+            Conditions        = [string]$Conditions
+            Actions           = [string]$Actions
+            BecActions        = [string](ConvertTo-Json -InputObject $BecActions -Compress -Depth 5)
+            type              = $Request.Body.logbook.value
+            RowKey            = $RowKey
+            PartitionKey      = 'Webhookv2'
+            AlertComment      = [string]$Request.Body.AlertComment
+            CustomSubject     = [string]$Request.Body.CustomSubject
+            # The audit form posts the raw form values, so an autocomplete selection arrives as a
+            # {label, value} object - unwrap it to the bare Halo priority id before storing.
+            PsaTicketPriority = [string]($Request.Body.PsaTicketPriority.value ?? $Request.Body.PsaTicketPriority)
         }
         $WebhookTable = Get-CippTable -TableName 'WebhookRules'
+        if ($Request.Body.RowKey) {
+            # Editing replaces the entity, so carry the disabled state over to keep a disabled alert disabled
+            $ExistingAlert = Get-CIPPAzDataTableEntity @WebhookTable -Filter "RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $RowKey)'" -Property RowKey, Disabled, Tenants
+            if ($ExistingAlert -and -not (Test-CippTenantInScope -Tenant ($ExistingAlert.Tenants | ConvertFrom-Json -ErrorAction SilentlyContinue))) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::Forbidden
+                        Body       = @{ Results = 'Access to this alert is not allowed' }
+                    })
+            }
+            if ($ExistingAlert.Disabled -eq $true) {
+                $CompleteObject.Disabled = $true
+            }
+        }
         Add-CIPPAzDataTableEntity @WebhookTable -Entity $CompleteObject -Force
         $Results = "Added Audit Log Alert for $($Tenants.count) tenants. It may take up to four hours before Microsoft starts delivering these alerts."
         Write-LogMessage -API 'AddAlert' -message $Results -sev Info -LogData $CompleteObject -headers $Request.Headers

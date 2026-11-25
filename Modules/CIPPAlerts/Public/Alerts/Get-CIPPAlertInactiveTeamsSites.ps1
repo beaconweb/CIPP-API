@@ -11,7 +11,7 @@ function Get-CIPPAlertInactiveTeamsSites {
         $TenantFilter
     )
 
-    $HasTeams = Test-CIPPStandardLicense -StandardName 'InactiveTeamsSites' -TenantFilter $TenantFilter -Preset Teams
+    $HasTeams = Test-CIPPStandardLicense -StandardName 'InactiveTeamsSites' -TenantFilter $TenantFilter -Preset Teams -SkipLog
     if (-not $HasTeams) {
         return
     }
@@ -91,9 +91,7 @@ function Get-CIPPAlertInactiveTeamsSites {
             }
         }
 
-        if ($AlertData) {
-            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-        }
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-AlertMessage -message "Inactive TeamsSite alert failed: $($ErrorMessage.NormalizedError)" -tenant $TenantFilter -LogData $ErrorMessage

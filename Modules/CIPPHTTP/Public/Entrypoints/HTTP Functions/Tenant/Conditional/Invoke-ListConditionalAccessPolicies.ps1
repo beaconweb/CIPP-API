@@ -1,11 +1,11 @@
 function Invoke-ListConditionalAccessPolicies {
     <#
     .FUNCTIONALITY
-        Entrypoint
+        Entrypoint,TenantGroup
     .ROLE
         Tenant.ConditionalAccess.Read
     .DESCRIPTION
-        Lists Conditional Access policies for a tenant with resolved display names for users, groups, applications, and locations.
+        Lists Conditional Access policies for a tenant with resolved display names for users, groups, applications, and locations. When manualPagination is set on an AllTenants read, one page is returned per request with a continuation token in Metadata.nextLink.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -120,7 +120,7 @@ function Invoke-ListConditionalAccessPolicies {
             $Requests = @(
                 @{
                     id     = 'policies'
-                    url    = 'identity/conditionalAccess/policies'
+                    url    = 'identity/conditionalAccess/policies?$orderby=displayName'
                     method = 'GET'
                 }
                 @{
@@ -155,9 +155,13 @@ function Invoke-ListConditionalAccessPolicies {
                 }
             )
 
-            $BulkResults = New-GraphBulkRequest -Requests $Requests -tenantid $TenantFilter -asapp $true
+            $BulkResults = New-GraphBulkRequest -Requests $Requests -tenantid $TenantFilter -asapp $true -ErrorAction Stop
 
-            $ConditionalAccessPolicyOutput = ($BulkResults | Where-Object { $_.id -eq 'policies' }).body.value
+            $PoliciesResult = $BulkResults | Where-Object { $_.id -eq 'policies' }
+            if ($PoliciesResult.status -ge 400) {
+                throw ($PoliciesResult.body.error.message ?? "Graph returned status $($PoliciesResult.status) listing Conditional Access policies")
+            }
+            $ConditionalAccessPolicyOutput = $PoliciesResult.body.value
             $AllNamedLocations = ($BulkResults | Where-Object { $_.id -eq 'namedLocations' }).body.value
             $AllApplications = ($BulkResults | Where-Object { $_.id -eq 'applications' } ).body.value
             $AllRoleDefinitions = ($BulkResults | Where-Object { $_.id -eq 'roleDefinitions' }).body.value
@@ -200,8 +204,22 @@ function Invoke-ListConditionalAccessPolicies {
             # AllTenants functionality
             $Table = Get-CIPPTable -TableName cacheCAPolicies
             $PartitionKey = 'CAPolicy'
-            $Filter = "PartitionKey eq '$PartitionKey'"
-            $Rows = Get-CIPPAzDataTableEntity @Table -filter $Filter | Where-Object -Property Timestamp -GT (Get-Date).AddMinutes(-60)
+            # Return one page per request with a continuation token in Metadata.nextLink; AllTenants reads only.
+            $ManualPagination = $Request.Query.manualPagination -and [System.Convert]::ToBoolean($Request.Query.manualPagination)
+            if ($ManualPagination) {
+                # Rows per page, clamped between 250 and 10000. Defaults to 5000.
+                $PageSize = 5000
+                if ($Request.Query.PageSize -as [int]) {
+                    $PageSize = [Math]::Min([Math]::Max([int]$Request.Query.PageSize, 250), 10000)
+                }
+                $FreshClause = "Timestamp ge datetime'{0}'" -f (Get-Date).AddMinutes(-60).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+                # Continuation token from the previous page's Metadata.nextLink; opaque to callers.
+                $Page = Get-CIPPPagedTableRows -Table $Table -PartitionKeys @($PartitionKey) -PageSize $PageSize -ContinuationToken $Request.Query.nextLink -ExtraFilterClauses @($FreshClause)
+                $Rows = @($Page.Rows)
+            } else {
+                $Filter = "PartitionKey eq '$PartitionKey'"
+                $Rows = Get-CIPPAzDataTableEntity @Table -filter $Filter | Where-Object -Property Timestamp -GT (Get-Date).AddMinutes(-60)
+            }
             $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
             $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
             # If a queue is running, we will not start a new one
@@ -210,7 +228,7 @@ function Invoke-ListConditionalAccessPolicies {
                     QueueMessage = 'Still loading data for all tenants. Please check back in a few more minutes'
                     QueueId      = $RunningQueue.RowKey
                 }
-            } elseif (!$Rows -and !$RunningQueue) {
+            } elseif (!$Rows -and !$RunningQueue -and !$Request.Query.nextLink) {
                 # If no rows are found and no queue is running, we will start a new one
                 $TenantList = Get-Tenants -IncludeErrors
                 $Queue = New-CippQueueEntry -Name 'Conditional Access Policies - All Tenants' -Link '/tenant/conditional/list-policies?customerId=AllTenants' -Reference $QueueReference -TotalTasks ($TenantList | Measure-Object).Count
@@ -235,24 +253,39 @@ function Invoke-ListConditionalAccessPolicies {
                 $Metadata = [PSCustomObject]@{
                     QueueId = $RunningQueue.RowKey ?? $null
                 }
-                $Policies = $Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant'
-                # Output all policies from all tenants the caller is allowed to see
-                foreach ($policy in $Policies) {
-                    ($policy.Policy | ConvertFrom-Json)
+                if ($ManualPagination -and $Page.NextToken) {
+                    $Metadata | Add-Member -NotePropertyName 'nextLink' -NotePropertyValue $Page.NextToken
                 }
+                # Each cached Policy blob is already the final shape; stitch the allowed rows
+                # into Results verbatim instead of parsing and letting Craft re-serialize.
+                $AllowedRows = @($Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant')
+                $JsonParts = [System.Collections.Generic.List[string]]::new($AllowedRows.Count)
+                foreach ($Row in $AllowedRows) {
+                    $Blob = [string]$Row.Policy
+                    if ([string]::IsNullOrWhiteSpace($Blob)) { continue }
+                    $Blob = $Blob.Trim()
+                    if ($Blob[0] -eq '{' -or $Blob[0] -eq '[') { $JsonParts.Add($Blob) }
+                }
+                $ResultsJson = '[' + ($JsonParts -join ',') + ']'
+                $MetadataJson = ConvertTo-Json -InputObject $Metadata -Depth 5 -Compress
+                return ([HttpResponseContext]@{
+                        StatusCode  = [HttpStatusCode]::OK
+                        ContentType = 'application/json'
+                        Body        = '{"Results":' + $ResultsJson + ',"Metadata":' + $MetadataJson + '}'
+                    })
             }
         }
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
-        $StatusCode = [HttpStatusCode]::Forbidden
-        $GraphRequest = $ErrorMessage
+        $StatusCode = [HttpStatusCode]::InternalServerError
+        $Body = $ErrorMessage
     }
 
     if (!$Body) {
         $StatusCode = [HttpStatusCode]::OK
         $Body = [PSCustomObject]@{
-            Results  = @($GraphRequest | Where-Object -Property id -NE $null | Sort-Object id -Descending)
+            Results  = @($GraphRequest | Where-Object -Property id -NE $null)
             Metadata = $Metadata
         }
     }

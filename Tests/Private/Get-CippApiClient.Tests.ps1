@@ -1,0 +1,143 @@
+# Pester tests for Get-CippApiClient.
+#
+# IPRange is stored as a JSON array string. Blank or unparseable means unrestricted (Any).
+# A stored literal '[]' must mean the same thing, and must never leak an extra element into
+# the returned client list.
+
+BeforeAll {
+    $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
+    $FunctionPath = Join-Path $RepoRoot 'Modules/CIPPCore/Public/Authentication/Get-CippApiClient.ps1'
+
+    function Get-CIPPTable { param($TableName) }
+    function Get-CIPPAzDataTableEntity { param($TableName, $Filter) }
+
+    . $FunctionPath
+
+    $script:AppId = '11111111-2222-3333-4444-555555555555'
+}
+
+Describe 'Get-CippApiClient' {
+    BeforeEach {
+        $script:CippApiClientMemo = $null
+        Mock -CommandName Get-CIPPTable -MockWith { @{ TableName = 'ApiClients' } }
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { $script:Rows }
+    }
+
+    Context 'one read per invocation' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = $script:AppId; AppName = 'Memo'; Role = 'readonly'; IPRange = ''; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'reads the table once for repeated lookups of the same client, including an unknown one' {
+            $null = Get-CippApiClient -AppId $script:AppId
+            (Get-CippApiClient -AppId $script:AppId).AppName | Should -Be 'Memo'
+            $script:Rows = @()
+            $null = Get-CippApiClient -AppId 'unknown'
+            Get-CippApiClient -AppId 'unknown' | Should -BeNullOrEmpty
+            Should -Invoke Get-CIPPAzDataTableEntity -Times 2 -Exactly
+        }
+
+        It 'never serves a listing of every client from the memo' {
+            $null = Get-CippApiClient -AppId $script:AppId
+            $null = Get-CippApiClient
+            $null = Get-CippApiClient
+            Should -Invoke Get-CIPPAzDataTableEntity -Times 3 -Exactly
+        }
+    }
+
+    Context 'IPRange stored as an empty array' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = $script:AppId; AppName = 'Empty'; Role = 'readonly'; IPRange = '[]'; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'returns only the client, no extra element' {
+            $Result = @(Get-CippApiClient -AppId $script:AppId)
+            $Result.Count | Should -Be 1
+            $Result[0].ClientId | Should -Be $script:AppId
+        }
+
+        It 'treats the empty array as Any' {
+            $Result = Get-CippApiClient -AppId $script:AppId
+            @($Result.IPRange) | Should -Be @('Any')
+        }
+    }
+
+    Context 'IPRange stored with ranges' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = $script:AppId; AppName = 'Ranged'; Role = 'readonly'; IPRange = '["10.0.0.0/8","192.168.1.1"]'; Enabled = $true; MCPAllowed = $true }
+            )
+        }
+
+        It 'returns the parsed ranges' {
+            $Result = Get-CippApiClient -AppId $script:AppId
+            @($Result.IPRange) | Should -Be @('10.0.0.0/8', '192.168.1.1')
+        }
+
+        It 'does not add Any alongside real ranges' {
+            $Result = Get-CippApiClient -AppId $script:AppId
+            @($Result.IPRange) | Should -Not -Contain 'Any'
+        }
+    }
+
+    Context 'IPRange blank' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = $script:AppId; AppName = 'Blank'; Role = 'readonly'; IPRange = ''; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'treats blank as Any' {
+            $Result = Get-CippApiClient -AppId $script:AppId
+            @($Result.IPRange) | Should -Be @('Any')
+        }
+    }
+
+    Context 'IPRange unparseable' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = $script:AppId; AppName = 'Broken'; Role = 'readonly'; IPRange = 'not json'; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'treats unparseable as Any' {
+            $Result = Get-CippApiClient -AppId $script:AppId
+            @($Result.IPRange) | Should -Be @('Any')
+        }
+    }
+
+    Context 'Multiple clients, one with an empty array' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = 'aaaaaaaa-0000-0000-0000-000000000001'; AppName = 'One'; Role = 'readonly'; IPRange = '[]'; Enabled = $true; MCPAllowed = $false }
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = 'aaaaaaaa-0000-0000-0000-000000000002'; AppName = 'Two'; Role = 'editor'; IPRange = '["10.0.0.0/8"]'; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'returns exactly one object per stored row' {
+            $Result = @(Get-CippApiClient)
+            $Result.Count | Should -Be 2
+            $Result.ClientId | Should -Be @('aaaaaaaa-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000002')
+        }
+    }
+
+    Context 'Enabled stored as a legacy string' {
+        BeforeEach {
+            $script:Rows = @(
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = 'aaaaaaaa-0000-0000-0000-000000000001'; AppName = 'On'; Role = 'readonly'; IPRange = ''; Enabled = 'True'; MCPAllowed = $false }
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = 'aaaaaaaa-0000-0000-0000-000000000002'; AppName = 'Off'; Role = 'readonly'; IPRange = ''; Enabled = 'False'; MCPAllowed = $false }
+                [pscustomobject]@{ PartitionKey = 'ApiClients'; RowKey = 'aaaaaaaa-0000-0000-0000-000000000003'; AppName = 'Bool'; Role = 'readonly'; IPRange = ''; Enabled = $true; MCPAllowed = $false }
+            )
+        }
+
+        It 'returns Enabled as a bool' {
+            $Result = @(Get-CippApiClient)
+            $Result.Enabled | Should -Be @($true, $false, $true)
+            $Result.Enabled | ForEach-Object { $_ | Should -BeOfType [bool] }
+        }
+    }
+}

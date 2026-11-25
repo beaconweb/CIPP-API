@@ -12,13 +12,28 @@ function Get-ClassicAPIToken($tenantID, $Resource) {
         $uri = "https://login.microsoftonline.com/$($TenantID)/oauth2/token"
         $Body = @{
             client_id     = $env:ApplicationID
-            client_secret = $env:ApplicationSecret
             resource      = $Resource
             refresh_token = $env:RefreshToken
             grant_type    = 'refresh_token'
         }
+        # Certificate-exclusive auth: sign an assertion instead of sending the client secret. The
+        # audience must be the classic v1 token endpoint this request targets.
+        if ($env:CertificateAuthMode) {
+            $SAMCert = Get-CIPPSAMCertificate -ErrorAction Stop
+            if (-not $SAMCert) { throw 'Certificate authentication is enabled but no SAM certificate is available.' }
+            $Body.client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            $Body.client_assertion = New-CIPPCertificateAssertion -TenantId $TenantID -AppId $env:ApplicationID -Certificate $SAMCert.Certificate -Audience $uri
+        } else {
+            $Body.client_secret = $env:ApplicationSecret
+        }
         try {
             if (!$script:classictoken) { $script:classictoken = [HashTable]::Synchronized(@{}) }
+            # Shared by every worker for the life of the process, so expired tokens are removed here.
+            $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $Expired = foreach ($Entry in $script:classictoken.Clone().GetEnumerator()) {
+                if (($Entry.Value.expires_on -as [int64]) -le $Now) { $Entry.Key }
+            }
+            foreach ($Key in $Expired) { $script:classictoken.Remove($Key) }
             $script:classictoken.$TokenKey = Invoke-CIPPRestMethod -Uri $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction SilentlyContinue -Method post
             return $script:classictoken.$TokenKey
         } catch {
@@ -28,7 +43,6 @@ function Get-ClassicAPIToken($tenantID, $Resource) {
             $Tenant = Get-CIPPAzDataTableEntity @TenantsTable -Filter $Filter
             if (!$Tenant) {
                 $Tenant = @{
-                    GraphErrorCount     = $null
                     LastGraphTokenError = $null
                     LastGraphError      = $null
                     PartitionKey        = 'TenantFailed'
@@ -36,7 +50,6 @@ function Get-ClassicAPIToken($tenantID, $Resource) {
                 }
             }
             $Tenant.LastGraphError = $_.Exception.Message
-            $Tenant.GraphErrorCount++
 
             Update-AzDataTableEntity -Force @TenantsTable -Entity $Tenant
             Throw "Failed to obtain Classic API Token for $TenantID - $_"

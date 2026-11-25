@@ -20,7 +20,7 @@ function Get-CIPPTestResultsTenants {
         One or more test IDs (the row's RowKey), e.g. 'CustomScript-<guid>'.
 
     .PARAMETER Status
-        One or more statuses to filter on (Passed / Failed / Investigate / Skipped / Informational).
+        One or more statuses to filter on (Passed / Failed / Investigate / Skipped / Informational / Unlicensed).
 
     .PARAMETER TestType
         Restrict to a single test type (Identity / Devices / Custom).
@@ -47,6 +47,18 @@ function Get-CIPPTestResultsTenants {
         Also return aggregate counts (per status, high-risk failures, distinct tenants) computed
         over everything the scan matched — regardless of RowStatus. Changes the return shape to
         @{ Results; Counts }.
+
+        Counts also carries HighRiskTenants (distinct tenants with a high-risk failure) and
+        ByTestType — per test type, the failure count, the distinct tenants failing it, and the
+        checks failing across the most tenants. Those facets are computed over Failed rows only,
+        which is what "failing" means for every caller that has asked for them.
+
+    .PARAMETER CountsOnly
+        Return the aggregates with an empty Results array, and skip building rows entirely. Implies
+        -IncludeCounts and the -SummaryOnly projection.
+
+        For callers that render totals only. Returning the rows to aggregate client-side sends the
+        whole estate's result set over the wire, and grows linearly with tenant count.
 
     .PARAMETER AllowedTenantIds
         Customer ids the caller may see. When supplied, rows for other tenants are dropped before
@@ -86,8 +98,16 @@ function Get-CIPPTestResultsTenants {
         [switch]$IncludeCounts,
 
         [Parameter(Mandatory = $false)]
+        [switch]$CountsOnly,
+
+        [Parameter(Mandatory = $false)]
         [string[]]$AllowedTenantIds
     )
+
+    # CountsOnly is a stricter IncludeCounts: same aggregates, no rows built at all.
+    $WantCounts = $IncludeCounts.IsPresent -or $CountsOnly.IsPresent
+    # How many per-test-type checks to return in the ByTestType facet.
+    $TopCheckLimit = 10
 
     $Table = Get-CippTable -tablename 'CippTestResults'
 
@@ -104,8 +124,12 @@ function Get-CIPPTestResultsTenants {
         Write-Warning "Get-CIPPTestResultsTenants: failed to load tenant list: $($_.Exception.Message)"
     }
 
+    # Presence of the parameter is what marks the caller as restricted, not the list having
+    # entries: a restricted caller whose scope resolved to zero tenants passes @(), which is
+    # falsy, and a truthiness check would hand that caller the unrestricted path. An empty
+    # HashSet stays truthy at the filter below, so zero allowed ids reads zero partitions.
     $AllowedSet = $null
-    if ($AllowedTenantIds) {
+    if ($PSBoundParameters.ContainsKey('AllowedTenantIds')) {
         $AllowedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($Allowed in $AllowedTenantIds) { if ($Allowed) { [void]$AllowedSet.Add([string]$Allowed) } }
     }
@@ -129,33 +153,27 @@ function Get-CIPPTestResultsTenants {
     # Property clauses shared by every partition query.
     $FilterParts = [System.Collections.Generic.List[string]]::new()
     if ($TestId) {
-        $TestClause = (@($TestId | Where-Object { $_ }) | ForEach-Object { "RowKey eq '$_'" }) -join ' or '
+        $TestClause = (@($TestId | Where-Object { $_ }) | ForEach-Object { "RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $_)'" }) -join ' or '
         if ($TestClause) { $FilterParts.Add("($TestClause)") }
     }
     if ($Status) {
-        $StatusClause = (@($Status | Where-Object { $_ }) | ForEach-Object { "Status eq '$_'" }) -join ' or '
+        $StatusClause = (@($Status | Where-Object { $_ }) | ForEach-Object { "Status eq '$(ConvertTo-CIPPODataFilterValue -Value $_)'" }) -join ' or '
         if ($StatusClause) { $FilterParts.Add("($StatusClause)") }
     }
-    if ($TestType) { $FilterParts.Add("TestType eq '$TestType'") }
-    if ($Risk) { $FilterParts.Add("Risk eq '$Risk'") }
-    if ($Category) { $FilterParts.Add("Category eq '$Category'") }
+    if ($TestType) { $FilterParts.Add("TestType eq '$(ConvertTo-CIPPODataFilterValue -Value $TestType)'") }
+    if ($Risk) { $FilterParts.Add("Risk eq '$(ConvertTo-CIPPODataFilterValue -Value $Risk)'") }
+    if ($Category) { $FilterParts.Add("Category eq '$(ConvertTo-CIPPODataFilterValue -Value $Category)'") }
     $PropertyFilter = $FilterParts -join ' and '
 
     $GetParams = @{}
-    if ($SummaryOnly) {
+    if ($CountsOnly) {
+        # Counting reads only these columns
+        $GetParams.Property = [string[]]@('PartitionKey', 'RowKey', 'Status', 'Risk', 'Name', 'TestType')
+    } elseif ($SummaryOnly) {
         $GetParams.Property = [string[]]@(
             'PartitionKey', 'RowKey', 'Timestamp', 'Status', 'Risk', 'Name', 'Pillar',
             'UserImpact', 'ImplementationEffort', 'Category', 'TestType'
         )
-    }
-
-    $Results = [System.Collections.Generic.List[object]]::new()
-    foreach ($Domain in $TargetTenants) {
-        $PartitionFilter = "PartitionKey eq '$($Domain -replace "'", "''")'"
-        if ($PropertyFilter) { $PartitionFilter = "$PartitionFilter and $PropertyFilter" }
-        foreach ($Row in @(Get-CIPPAzDataTableEntity @Table @GetParams -Filter $PartitionFilter)) {
-            if ($null -ne $Row) { $Results.Add($Row) }
-        }
     }
 
     $Counts = [ordered]@{
@@ -168,11 +186,8 @@ function Get-CIPPTestResultsTenants {
         HighRiskFailed     = 0
         TenantsWithResults = 0
         TenantsFailing     = 0
-    }
-
-    if ($Results.Count -eq 0) {
-        if ($IncludeCounts) { return [PSCustomObject]@{ Results = @(); Counts = [PSCustomObject]$Counts } }
-        return @()
+        HighRiskTenants    = 0
+        ByTestType         = [PSCustomObject]@{}
     }
 
     # Label rows with their suite via the canonical suite patterns (shared with
@@ -184,34 +199,8 @@ function Get-CIPPTestResultsTenants {
         $SuiteIdPatterns[$SuiteEntry.Key] = $SuiteEntry.Value -replace '^Invoke-CippTest', ''
     }
 
-    # Enrich Custom rows with their definition (latest version per ScriptGuid), mirroring the
-    # per-tenant enrichment in Invoke-ListTests so the shared off-canvas renders identically.
-    $CustomMeta = @{}
-    if ($Results.Where({ $_.TestType -eq 'Custom' }, 'First').Count -gt 0) {
-        $ScriptTable = Get-CippTable -tablename 'CustomPowershellScripts'
-        $Scripts = @(Get-CIPPAzDataTableEntity @ScriptTable -Filter "PartitionKey eq 'CustomScript'")
-        $LatestByGuid = @{}
-        foreach ($Script in $Scripts) {
-            if (-not $Script.ScriptGuid) { continue }
-            $Existing = $LatestByGuid[$Script.ScriptGuid]
-            if (-not $Existing -or [int]$Script.Version -gt [int]$Existing.Version) {
-                $LatestByGuid[$Script.ScriptGuid] = $Script
-            }
-        }
-        foreach ($Script in $LatestByGuid.Values) {
-            # Treat a missing Enabled property as enabled, matching Invoke-CIPPTestCollection.
-            # A disabled (or deleted) script can still have stale results in the table; surfacing
-            # this lets the UI show that the data no longer reflects an active test.
-            $EnabledProp = $Script.PSObject.Properties['Enabled']
-            $CustomMeta[$Script.ScriptGuid] = [PSCustomObject]@{
-                ScriptName       = $Script.ScriptName ?? ''
-                Description      = $Script.Description ?? ''
-                ReturnType       = $Script.ReturnType ?? 'JSON'
-                MarkdownTemplate = $Script.MarkdownTemplate ?? ''
-                Enabled          = (-not $EnabledProp) -or [bool]$EnabledProp.Value
-            }
-        }
-    }
+    # Custom script definitions, read on the first Custom row built
+    $CustomMeta = $null
 
     $RowStatusSet = $null
     if ($RowStatus) {
@@ -221,84 +210,174 @@ function Get-CIPPTestResultsTenants {
 
     $TenantsSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $TenantsFailing = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $HighRiskTenants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # testType -> @{ Failed; Tenants (set); Checks (name -> set of tenants) }. Tenant sets rather
+    # than counters because the same check failing twice for one tenant is still one tenant.
+    $FailedByType = @{}
 
     # Single pass: count, then build only the rows the caller asked for. Access control already
     # happened at the partition level. Rows are rebuilt as fresh objects rather than mutated with
     # Add-Member — at estate scale (a hundred-plus tenants x hundreds of tests) the Add-Member
     # calls dominated response time.
-    $Output = [System.Collections.Generic.List[object]]::new($Results.Count)
-    foreach ($Result in $Results) {
-        $TenantInfo = $TenantLookup[$Result.PartitionKey]
-        $TenantId = [string]($TenantInfo.customerId ?? '')
+    # Each partition is counted as it is read, so the estate's rows are never held at once
+    $Output = [System.Collections.Generic.List[object]]::new()
+    foreach ($Domain in $TargetTenants) {
+        $PartitionFilter = "PartitionKey eq '$($Domain -replace "'", "''")'"
+        if ($PropertyFilter) { $PartitionFilter = "$PartitionFilter and $PropertyFilter" }
+        foreach ($Result in @(Get-CIPPAzDataTableEntity @Table @GetParams -Filter $PartitionFilter)) {
+            if ($null -eq $Result) { continue }
+            $TenantInfo = $TenantLookup[$Result.PartitionKey]
+            $TenantId = [string]($TenantInfo.customerId ?? '')
 
-        $StatusValue = [string]$Result.Status
-        $Counts['TotalResults']++
-        [void]$TenantsSeen.Add($Result.PartitionKey)
-        switch ($StatusValue) {
-            'Passed' { $Counts['Passed']++ }
-            'Failed' {
-                $Counts['Failed']++
-                [void]$TenantsFailing.Add($Result.PartitionKey)
-                if ([string]$Result.Risk -eq 'High') { $Counts['HighRiskFailed']++ }
-            }
-            'Investigate' { $Counts['Investigate']++ }
-            'Skipped' { $Counts['Skipped']++ }
-            'Informational' { $Counts['Informational']++ }
-        }
+            $StatusValue = [string]$Result.Status
+            $Counts['TotalResults']++
+            [void]$TenantsSeen.Add($Result.PartitionKey)
+            switch ($StatusValue) {
+                'Passed' { $Counts['Passed']++ }
+                'Failed' {
+                    $Counts['Failed']++
+                    [void]$TenantsFailing.Add($Result.PartitionKey)
+                    if ([string]$Result.Risk -eq 'High') {
+                        $Counts['HighRiskFailed']++
+                        [void]$HighRiskTenants.Add($Result.PartitionKey)
+                    }
 
-        if ($RowStatusSet -and -not $RowStatusSet.Contains($StatusValue)) { continue }
+                    $TypeKey = [string]$Result.TestType
+                    if ($TypeKey) {
+                        if (-not $FailedByType.ContainsKey($TypeKey)) {
+                            $FailedByType[$TypeKey] = @{
+                                Failed  = 0
+                                Tenants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                Checks  = @{}
+                            }
+                        }
+                        $Bucket = $FailedByType[$TypeKey]
+                        $Bucket.Failed++
+                        [void]$Bucket.Tenants.Add($Result.PartitionKey)
 
-        $Row = [ordered]@{}
-        foreach ($Prop in $Result.PSObject.Properties) { $Row[$Prop.Name] = $Prop.Value }
-        $Row['Tenant'] = $Result.PartitionKey
-        $Row['TenantId'] = $TenantId
-        $Row['TenantName'] = $TenantInfo.displayName ?? $Result.PartitionKey
-
-        $Suite = ''
-        if ($Result.RowKey -like 'CustomScript-*') {
-            $Suite = 'Custom'
-        } else {
-            foreach ($SuitePattern in $SuiteIdPatterns.GetEnumerator()) {
-                if ($Result.RowKey -like $SuitePattern.Value) { $Suite = $SuitePattern.Key; break }
-            }
-        }
-        $Row['Suite'] = $Suite
-
-        # Surface the Azure entity timestamp as a stable, serialisable last-run field.
-        $LastRun = $Result.Timestamp
-        if ($LastRun -is [DateTimeOffset]) {
-            $LastRun = $LastRun.UtcDateTime.ToString('o')
-        } elseif ($LastRun) {
-            $LastRun = [string]$LastRun
-        }
-        $Row['LastRun'] = $LastRun
-
-        if ($Result.TestType -eq 'Custom') {
-            $ScriptGuid = ($Result.RowKey -replace '^CustomScript-', '')
-            if (-not [string]::IsNullOrWhiteSpace($ScriptGuid) -and $CustomMeta.ContainsKey($ScriptGuid)) {
-                $Meta = $CustomMeta[$ScriptGuid]
-                $Row['Description'] = $Meta.Description
-                $Row['ReturnType'] = $Meta.ReturnType
-                if (-not $SummaryOnly) { $Row['MarkdownTemplate'] = $Meta.MarkdownTemplate }
-                $Row['Enabled'] = $Meta.Enabled
-                if ([string]::IsNullOrWhiteSpace([string]$Row['Name']) -and $Meta.ScriptName) {
-                    $Row['Name'] = $Meta.ScriptName
+                        $CheckName = [string]$Result.Name
+                        if ($CheckName) {
+                            if (-not $Bucket.Checks.ContainsKey($CheckName)) {
+                                $Bucket.Checks[$CheckName] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                            }
+                            [void]$Bucket.Checks[$CheckName].Add($Result.PartitionKey)
+                        }
+                    }
                 }
-            } else {
-                # Result exists but the script no longer does (deleted). The data is stale — flag
-                # it as not enabled so the column stays populated and truthful.
-                $Row['Enabled'] = $false
+                'Investigate' { $Counts['Investigate']++ }
+                'Skipped' { $Counts['Skipped']++ }
+                'Informational' { $Counts['Informational']++ }
+                'Unlicensed' { $Counts['Informational']++ }
             }
-        }
 
-        $Output.Add([PSCustomObject]$Row)
+            if ($RowStatusSet -and -not $RowStatusSet.Contains($StatusValue)) { continue }
+            # Counting is done for this row; a counts-only caller wants none of the row building below.
+            if ($CountsOnly) { continue }
+
+            $Row = [ordered]@{}
+            foreach ($Prop in $Result.PSObject.Properties) { $Row[$Prop.Name] = $Prop.Value }
+            $Row['Tenant'] = $Result.PartitionKey
+            $Row['TenantId'] = $TenantId
+            $Row['TenantName'] = $TenantInfo.displayName ?? $Result.PartitionKey
+
+            $Suite = ''
+            if ($Result.RowKey -like 'CustomScript-*') {
+                $Suite = 'Custom'
+            } else {
+                foreach ($SuitePattern in $SuiteIdPatterns.GetEnumerator()) {
+                    if ($Result.RowKey -like $SuitePattern.Value) { $Suite = $SuitePattern.Key; break }
+                }
+            }
+            $Row['Suite'] = $Suite
+
+            # Surface the Azure entity timestamp as a stable, serialisable last-run field.
+            $LastRun = $Result.Timestamp
+            if ($LastRun -is [DateTimeOffset]) {
+                $LastRun = $LastRun.UtcDateTime.ToString('o')
+            } elseif ($LastRun) {
+                $LastRun = [string]$LastRun
+            }
+            $Row['LastRun'] = $LastRun
+
+            if ($Result.TestType -eq 'Custom') {
+                # Latest version per ScriptGuid, mirroring Invoke-ListTests so the shared off-canvas renders identically
+                if ($null -eq $CustomMeta) {
+                    $CustomMeta = @{}
+                    $ScriptTable = Get-CippTable -tablename 'CustomPowershellScripts'
+                    $Scripts = @(Get-CIPPAzDataTableEntity @ScriptTable -Filter "PartitionKey eq 'CustomScript'")
+                    $LatestByGuid = @{}
+                    foreach ($Script in $Scripts) {
+                        if (-not $Script.ScriptGuid) { continue }
+                        $Existing = $LatestByGuid[$Script.ScriptGuid]
+                        if (-not $Existing -or [int]$Script.Version -gt [int]$Existing.Version) {
+                            $LatestByGuid[$Script.ScriptGuid] = $Script
+                        }
+                    }
+                    foreach ($Script in $LatestByGuid.Values) {
+                        # Treat a missing Enabled property as enabled, matching Invoke-CIPPTestCollection.
+                        # A disabled (or deleted) script can still have stale results in the table; surfacing
+                        # this lets the UI show that the data no longer reflects an active test.
+                        $EnabledProp = $Script.PSObject.Properties['Enabled']
+                        $CustomMeta[$Script.ScriptGuid] = [PSCustomObject]@{
+                            ScriptName       = $Script.ScriptName ?? ''
+                            Description      = $Script.Description ?? ''
+                            ReturnType       = $Script.ReturnType ?? 'JSON'
+                            MarkdownTemplate = $Script.MarkdownTemplate ?? ''
+                            Enabled          = (-not $EnabledProp) -or [bool]$EnabledProp.Value
+                        }
+                    }
+                }
+                $ScriptGuid = ($Result.RowKey -replace '^CustomScript-', '')
+                if (-not [string]::IsNullOrWhiteSpace($ScriptGuid) -and $CustomMeta.ContainsKey($ScriptGuid)) {
+                    $Meta = $CustomMeta[$ScriptGuid]
+                    $Row['Description'] = $Meta.Description
+                    $Row['ReturnType'] = $Meta.ReturnType
+                    if (-not $SummaryOnly) { $Row['MarkdownTemplate'] = $Meta.MarkdownTemplate }
+                    $Row['Enabled'] = $Meta.Enabled
+                    if ([string]::IsNullOrWhiteSpace([string]$Row['Name']) -and $Meta.ScriptName) {
+                        $Row['Name'] = $Meta.ScriptName
+                    }
+                } else {
+                    # Result exists but the script no longer does (deleted). The data is stale — flag
+                    # it as not enabled so the column stays populated and truthful.
+                    $Row['Enabled'] = $false
+                }
+            }
+
+            $Output.Add([PSCustomObject]$Row)
+        }
     }
 
-    if ($IncludeCounts) {
+    if ($Counts['TotalResults'] -eq 0) {
+        if ($WantCounts) { return [PSCustomObject]@{ Results = @(); Counts = [PSCustomObject]$Counts } }
+        return @()
+    }
+
+    if ($WantCounts) {
         $Counts['TenantsWithResults'] = $TenantsSeen.Count
         $Counts['TenantsFailing'] = $TenantsFailing.Count
+        $Counts['HighRiskTenants'] = $HighRiskTenants.Count
+
+        $ByTestType = [ordered]@{}
+        foreach ($TypeKey in ($FailedByType.Keys | Sort-Object)) {
+            $Bucket = $FailedByType[$TypeKey]
+            # Ties broken by name so the list is stable between calls with identical data.
+            $TopChecks = @(
+                $Bucket.Checks.GetEnumerator() |
+                    Sort-Object -Property @{ Expression = { $_.Value.Count }; Descending = $true }, Key |
+                    Select-Object -First $TopCheckLimit |
+                    ForEach-Object { [PSCustomObject]@{ Name = $_.Key; TenantCount = $_.Value.Count } }
+            )
+            $ByTestType[$TypeKey] = [PSCustomObject]@{
+                Failed    = $Bucket.Failed
+                Tenants   = $Bucket.Tenants.Count
+                TopChecks = $TopChecks
+            }
+        }
+        $Counts['ByTestType'] = [PSCustomObject]$ByTestType
+
         return [PSCustomObject]@{
-            Results = $Output
+            Results = if ($CountsOnly) { @() } else { $Output }
             Counts  = [PSCustomObject]$Counts
         }
     }

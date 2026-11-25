@@ -18,16 +18,23 @@ function Invoke-ExecGDAPRoleTemplate {
     if ($Request.Query.TemplateId) {
         $Template = $Templates | Where-Object -Property RowKey -EQ $Request.Query.TemplateId
         if (!$Template) {
-            Write-LogMessage -headers $Headers -API $APIName -message "GDAP role template '$($Request.Query.TemplateId)' not found" -sev 'Warning'
+            Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "GDAP role template '$($Request.Query.TemplateId)' not found" -sev 'Warning'
             $Body = @{}
         } else {
-            Write-LogMessage -headers $Headers -API $APIName -message "Retrieved GDAP role template '$($Request.Query.TemplateId)'" -Sev 'Info'
+            Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Retrieved GDAP role template '$($Request.Query.TemplateId)'" -Sev 'Info'
             $Body = @{
                 TemplateId   = $Template.RowKey
                 RoleMappings = @($Template.RoleMappings | ConvertFrom-Json)
             }
         }
     } else {
+        # Templates apply to every customer, so a tenant-limited role cannot change them.
+        if ($Request.Query.Action -in @('Add', 'Save', 'Edit', 'Delete') -and -not (Test-CippTenantInScope -Tenant 'AllTenants')) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::Forbidden
+                    Body       = @{ Results = 'GDAP role templates apply to every tenant. Changing them needs a role that is not limited to specific tenants.' }
+                })
+        }
         switch ($Request.Query.Action) {
             'Add' {
                 $RowKey = ($Request.Body | Select-Object -First 1 -ExpandProperty TemplateId).value ?? $Request.Body.TemplateId
@@ -37,10 +44,55 @@ function Invoke-ExecGDAPRoleTemplate {
                     $RoleMappings = $Request.Body.RoleMappings
                 }
                 Write-Information ($RoleMappings | ConvertTo-Json)
-                Add-CIPPGDAPRoleTemplate -TemplateId $RowKey -RoleMappings $RoleMappings
-                Write-LogMessage -headers $Headers -API $APIName -message "Added role mappings to GDAP template '$RowKey'" -Sev 'Info'
+                Add-CIPPGDAPRoleTemplate -Headers $Request.Headers -TemplateId $RowKey -RoleMappings $RoleMappings
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Added role mappings to GDAP template '$RowKey'" -Sev 'Info'
                 $Body = @{
                     Results = "Added role mappings to template $RowKey"
+                }
+            }
+            'Save' {
+                # Template-first save: creates any group mappings the editor asked for, then
+                # writes the full mapping set to the template in one shot.
+                $NewTemplateId = $Request.Body.TemplateId
+                $OriginalTemplateId = $Request.Body.OriginalTemplateId
+                $SaveResults = [System.Collections.Generic.List[string]]::new()
+                $RoleMappings = [System.Collections.Generic.List[object]]::new()
+
+                foreach ($Mapping in @($Request.Body.RoleMappings)) {
+                    if ($Mapping) { $RoleMappings.Add($Mapping) }
+                }
+
+                $NewRoles = @($Request.Body.NewRoles | Where-Object { $_ })
+                if ($NewRoles.Count -gt 0) {
+                    # New groups are created in the selected partner tenant (defaults to the primary)
+                    $PartnerTenantId = $Request.Body.partnerTenantId.value ?? $Request.Body.partnerTenantId
+                    if (!$PartnerTenantId -or -not (Get-CIPPPartnerTenantList | Where-Object { $_.partnerTenantId -eq $PartnerTenantId })) {
+                        $PartnerTenantId = $env:TenantID
+                    }
+                    $NewMappings = New-CIPPGDAPRoleMapping -Roles $NewRoles -CustomSuffix $Request.Body.CustomSuffix -PartnerTenantId $PartnerTenantId
+                    foreach ($Message in $NewMappings.Results) {
+                        $SaveResults.Add([string]$Message)
+                    }
+                    foreach ($Mapping in $NewMappings.RoleMappings) {
+                        if ($Mapping.GroupId -notin $RoleMappings.GroupId) {
+                            $RoleMappings.Add($Mapping)
+                        }
+                    }
+                }
+
+                if ($OriginalTemplateId -and $OriginalTemplateId -ne $NewTemplateId) {
+                    $OldTemplate = $Templates | Where-Object -Property RowKey -EQ $OriginalTemplateId
+                    if ($OldTemplate) {
+                        Remove-CIPPAzDataTableEntity -Force @Table -Entity $OldTemplate
+                        $SaveResults.Add("Renamed template $OriginalTemplateId to $NewTemplateId")
+                    }
+                }
+
+                Add-CIPPGDAPRoleTemplate -Headers $Request.Headers -TemplateId $NewTemplateId -RoleMappings @($RoleMappings | Select-Object -Property RoleName, GroupName, GroupId, roleDefinitionId) -Overwrite
+                $SaveResults.Add("Saved template $NewTemplateId")
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Saved GDAP role template '$NewTemplateId' with $($RoleMappings.Count) role mappings" -Sev 'Info'
+                $Body = @{
+                    Results = @($SaveResults)
                 }
             }
             'Edit' {
@@ -54,21 +106,21 @@ function Invoke-ExecGDAPRoleTemplate {
                     # If the template ID is being changed, delete the old one and create a new one
                     if ($OriginalRowKey -ne $NewRowKey) {
                         Remove-CIPPAzDataTableEntity -Force @Table -Entity $Template
-                        Add-CIPPGDAPRoleTemplate -TemplateId $NewRowKey -RoleMappings $RoleMappings -Overwrite
-                        Write-LogMessage -headers $Headers -API $APIName -message "Renamed GDAP template from '$OriginalRowKey' to '$NewRowKey' and updated role mappings" -Sev 'Info'
+                        Add-CIPPGDAPRoleTemplate -Headers $Request.Headers -TemplateId $NewRowKey -RoleMappings $RoleMappings -Overwrite
+                        Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Renamed GDAP template from '$OriginalRowKey' to '$NewRowKey' and updated role mappings" -Sev 'Info'
                         $Body = @{
                             Results = "Renamed template from $OriginalRowKey to $NewRowKey and updated role mappings"
                         }
                     } else {
                         # Just update the existing template
-                        Add-CIPPGDAPRoleTemplate -TemplateId $NewRowKey -RoleMappings $RoleMappings -Overwrite
-                        Write-LogMessage -headers $Headers -API $APIName -message "Updated role mappings for GDAP template '$NewRowKey'" -Sev 'Info'
+                        Add-CIPPGDAPRoleTemplate -Headers $Request.Headers -TemplateId $NewRowKey -RoleMappings $RoleMappings -Overwrite
+                        Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Updated role mappings for GDAP template '$NewRowKey'" -Sev 'Info'
                         $Body = @{
                             Results = "Updated role mappings for template $NewRowKey"
                         }
                     }
                 } else {
-                    Write-LogMessage -headers $Headers -API $APIName -message "GDAP role template '$OriginalRowKey' not found for editing" -sev 'Warning'
+                    Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "GDAP role template '$OriginalRowKey' not found for editing" -sev 'Warning'
                     $Body = @{
                         Results = "Template $OriginalRowKey not found"
                     }
@@ -79,23 +131,32 @@ function Invoke-ExecGDAPRoleTemplate {
                 $Template = $Templates | Where-Object -Property RowKey -EQ $RowKey
                 if ($Template) {
                     Remove-CIPPAzDataTableEntity -Force @Table -Entity $Template
-                    Write-LogMessage -headers $Headers -API $APIName -message "Deleted GDAP role template '$RowKey'" -Sev 'Info'
+                    Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Deleted GDAP role template '$RowKey'" -Sev 'Info'
                     $Body = @{
                         Results = "Deleted template $RowKey"
                     }
                 } else {
-                    Write-LogMessage -headers $Headers -API $APIName -message "GDAP role template '$RowKey' not found for deletion" -sev 'Warning'
+                    Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "GDAP role template '$RowKey' not found for deletion" -sev 'Warning'
                     $Body = @{
                         Results = "Template $RowKey not found"
                     }
                 }
             }
             default {
-                Write-LogMessage -headers $Headers -API $APIName -message "Retrieved $($Templates.Count) GDAP role templates" -Sev 'Info'
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Retrieved $($Templates.Count) GDAP role templates" -Sev 'Info'
+                $RolesTable = Get-CIPPTable -TableName 'GDAPRoles'
+                $RoleRows = Get-CIPPAzDataTableEntity @RolesTable -Filter "PartitionKey eq 'Roles'"
+                $Partners = @(Get-CIPPPartnerTenantList)
                 $Results = foreach ($Template in $Templates) {
+                    $Mappings = @($Template.RoleMappings | ConvertFrom-Json)
+                    # A template belongs to whichever partner(s) own its groups
+                    $TemplatePartnerIds = @($Mappings | ForEach-Object { $GroupId = $_.GroupId; ($RoleRows | Where-Object { $_.RowKey -eq $GroupId } | Select-Object -First 1).partnerTenantId } | ForEach-Object { if ($_) { "$_" } else { "$env:TenantID" } } | Sort-Object -Unique)
+                    $TemplatePartnerNames = @($TemplatePartnerIds | ForEach-Object { $Id = $_; ($Partners | Where-Object { $_.partnerTenantId -eq $Id }).displayName ?? $Id })
                     [PSCustomObject]@{
-                        TemplateId   = $Template.RowKey
-                        RoleMappings = @($Template.RoleMappings | ConvertFrom-Json)
+                        TemplateId         = $Template.RowKey
+                        RoleMappings       = $Mappings
+                        partnerTenantId    = ($TemplatePartnerIds -join ',')
+                        partnerDisplayName = ($TemplatePartnerNames -join ', ')
                     }
                 }
                 $Body = @{

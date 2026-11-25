@@ -11,6 +11,12 @@ function Get-CIPPAlertSoftDeletedMailboxes {
         $TenantFilter
     )
 
+    $HasLicense = Test-CIPPStandardLicense -StandardName 'SoftDeletedMailboxes' -TenantFilter $TenantFilter -Preset Exchange -SkipLog
+
+    if (-not $HasLicense) {
+        return
+    }
+
     $Select = 'ExchangeGuid,ArchiveGuid,WhenSoftDeleted,UserPrincipalName,IsInactiveMailbox'
 
     try {
@@ -21,9 +27,7 @@ function Get-CIPPAlertSoftDeletedMailboxes {
         $AlertData = $SoftDeletedMailBoxes | Where-Object { $_.IsInactiveMailbox -ne $true }
 
         # Write the alert trace with the filtered data
-        if ($AlertData) {
-            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-        }
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
 
     } catch {
         $ErrorMessage = Get-CippException -Exception $_

@@ -55,6 +55,16 @@ function Invoke-CIPPStandardFIDO2PasskeyProfiles {
         return
     }
 
+    # An AAGUID allow/block list only takes effect while key restrictions are enforced
+    # (keyRestrictions.isEnforced = $true). With the 'Enforce AAGUID Key Restrictions' switch left off,
+    # isEnforced was $false, so AAGUIDs an operator added were stored but never applied - the profile
+    # kept no active key restriction and any authenticator could still register, which reads as "the
+    # AAGUIDs did not add to the profile". Supplying AAGUIDs is an implicit request to restrict to them,
+    # so enable enforcement whenever AAGUIDs are present. (Confirmed live against Graph beta.)
+    if ($AAGUIDs.Count -gt 0) {
+        $EnforceKeyRestrictions = $true
+    }
+
     # Get current FIDO2 configuration
     try {
         $CurrentConfig = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/policies/authenticationmethodspolicy/authenticationMethodConfigurations/Fido2' -tenantid $Tenant -AsApp $true
@@ -67,6 +77,8 @@ function Invoke-CIPPStandardFIDO2PasskeyProfiles {
     # Find the default passkey profile
     $DefaultProfileId = $CurrentConfig.defaultPasskeyProfile
     $DefaultProfile = $CurrentConfig.passkeyProfiles | Where-Object { $_.id -eq $DefaultProfileId }
+    # The restriction type is dormant while restrictions are off, so keep whatever the tenant has
+    if (-not $EnforceKeyRestrictions -and $DefaultProfile.keyRestrictions.enforcementType) { $EnforcementType = $DefaultProfile.keyRestrictions.enforcementType }
 
     # Determine compliance against the default profile
     $StateIsCorrect = $false
@@ -154,6 +166,5 @@ function Invoke-CIPPStandardFIDO2PasskeyProfiles {
             AAGUIDs                = $AAGUIDs -join ', '
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.FIDO2PasskeyProfiles' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
-        Add-CIPPBPAField -FieldName 'FIDO2PasskeyProfiles' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $Tenant
     }
 }

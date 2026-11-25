@@ -1,11 +1,15 @@
 function Invoke-ExecUserBookmarks {
     <#
     .FUNCTIONALITY
-        Entrypoint
+        Entrypoint,AnyTenant
     .ROLE
         CIPP.Core.ReadWrite
     #>
     param($Request, $TriggerMetadata)
+
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+
     try {
         $Bookmarks = $Request.Body.currentSettings.bookmarks
         if ($null -eq $Bookmarks) {
@@ -16,7 +20,7 @@ function Invoke-ExecUserBookmarks {
 
         $object = $Bookmarks | ConvertTo-Json -Compress -Depth 10
         $Table = Get-CippTable -tablename 'UserSettings'
-        $User = $Request.Body.user
+        $User = ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Headers.'x-ms-client-principal')) | ConvertFrom-Json).userDetails
         $Table.Force = $true
         Add-CIPPAzDataTableEntity @Table -Entity @{
             JSON         = "$object"
@@ -24,11 +28,15 @@ function Invoke-ExecUserBookmarks {
             PartitionKey = 'UserBookmarks'
         }
         $StatusCode = [HttpStatusCode]::OK
-        $Results = [pscustomobject]@{'Results' = 'Successfully added user bookmarks' }
+        $Result = 'Successfully added user bookmarks'
+        Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Result -Sev 'Info'
+        $Results = [pscustomobject]@{'Results' = $Result }
     } catch {
         $ErrorMsg = Get-NormalizedError -message $($_.Exception.Message)
-        $Results = "Function Error: $ErrorMsg"
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $Result = "Function Error: $ErrorMsg"
+        Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Result -Sev 'Error'
+        $Results = $Result
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
     return [HttpResponseContext]@{
             StatusCode = $StatusCode

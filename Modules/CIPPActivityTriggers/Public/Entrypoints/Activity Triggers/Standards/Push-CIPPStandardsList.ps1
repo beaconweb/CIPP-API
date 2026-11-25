@@ -78,6 +78,7 @@ function Push-CIPPStandardsList {
                     @{ id = 'windowsFeatureUpdateProfiles'; url = "deviceManagement/windowsFeatureUpdateProfiles?`$select=id,lastModifiedDateTime,displayName&`$top=200"; method = 'GET' }
                     @{ id = 'windowsQualityUpdatePolicies'; url = "deviceManagement/windowsQualityUpdatePolicies?`$select=id,lastModifiedDateTime,displayName&`$top=200"; method = 'GET' }
                     @{ id = 'windowsQualityUpdateProfiles'; url = "deviceManagement/windowsQualityUpdateProfiles?`$select=id,lastModifiedDateTime,displayName&`$top=200"; method = 'GET' }
+                    @{ id = 'hardwareConfigurations'; url = "deviceManagement/hardwareConfigurations?`$select=id,lastModifiedDateTime,displayName&`$top=200"; method = 'GET' }
                 )
 
                 try {
@@ -165,6 +166,9 @@ function Push-CIPPStandardsList {
                     }
                     Write-Host "COMPLIANCE LOOKUP: Found $($IntuneComplianceLookup.Count) IntuneTemplate entries in alignment data"
 
+                    # Cache writes are deferred until after the loop: policies sharing a standards
+                    # template must all compare against the timestamp cached before this run.
+                    $StandardTemplateTimestamps = @{}
                     foreach ($Key in $IntuneKeys) {
                         $Template = $ComputedStandards[$Key]
                         $TemplateEntity = Get-CIPPAzDataTableEntity @TemplateTable -Filter "PartitionKey eq 'IntuneTemplate' and RowKey eq '$($Template.Settings.TemplateList.value)'"
@@ -206,11 +210,7 @@ function Push-CIPPStandardsList {
                                 Write-Host "STDTEMPLATE CHECK: TemplateId=$($Template.TemplateId) | No cached timestamp - treating as changed"
                             }
 
-                            Add-CIPPAzDataTableEntity @TrackingTable -Entity @{
-                                PartitionKey    = $TenantFilter
-                                RowKey          = "StandardTemplate_$($Template.TemplateId)"
-                                CachedTimestamp = $StandardTemplate.Timestamp
-                            } -Force | Out-Null
+                            $StandardTemplateTimestamps[$Template.TemplateId] = $StandardTemplate.Timestamp
                         }
 
                         if (-not $PolicyChanged -and -not $StandardTemplateChanged) {
@@ -240,6 +240,16 @@ function Push-CIPPStandardsList {
                         } else {
                             Write-Host "KEEPING: $Key - changed (PolicyChanged=$PolicyChanged, StdTemplateChanged=$StandardTemplateChanged)"
                         }
+                    }
+                    if ($StandardTemplateTimestamps.Count -gt 0) {
+                        $CacheRows = foreach ($StandardTemplateId in $StandardTemplateTimestamps.Keys) {
+                            @{
+                                PartitionKey    = $TenantFilter
+                                RowKey          = "StandardTemplate_$StandardTemplateId"
+                                CachedTimestamp = $StandardTemplateTimestamps[$StandardTemplateId]
+                            }
+                        }
+                        Add-CIPPAzDataTableEntity @TrackingTable -Entity @($CacheRows) -Force | Out-Null
                     }
                 } catch {
                     Write-Warning "Timestamp check failed for $TenantFilter : $($_.Exception.Message)"

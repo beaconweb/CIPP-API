@@ -11,6 +11,12 @@ function Get-CIPPAlertIntuneApprovalRequests {
         $TenantFilter
     )
 
+    $HasLicense = Test-CIPPStandardLicense -StandardName 'IntuneApprovalRequests' -TenantFilter $TenantFilter -Preset Intune -SkipLog
+
+    if (-not $HasLicense) {
+        return
+    }
+
     try {
         # Multi-admin approval holds a change until a second admin approves it. Nothing tells the
         # requestor it is waiting, so a pending request is a change someone believes they already made.
@@ -24,7 +30,7 @@ function Get-CIPPAlertIntuneApprovalRequests {
             # left null even for requests raised through Graph, so there is no 'who' to report.
             $Operation = ($ApprovalRequest.payloadOperation ?? 'change').ToLower()
             $Target = $ApprovalRequest.payloadName ?? (@($ApprovalRequest.requiredOperationApprovalPolicyTypes) -join ', ')
-            $Message = 'Intune {0} of "{1}" is waiting for multi-admin approval and expires {2}' -f $Operation, $Target, $ApprovalRequest.expirationDateTime
+            $Message = 'Intune {0} of "{1}" is waiting for multi-admin approval and expires {2}' -f $Operation, $Target, ([datetime]$ApprovalRequest.expirationDateTime).ToString('yyyy-MM-dd')
 
             $ApprovalRequest | Select-Object -Property id, status, requestDateTime, expirationDateTime, requestJustification,
             @{Name = 'operation'; Expression = { $ApprovalRequest.payloadOperation } },
@@ -32,9 +38,7 @@ function Get-CIPPAlertIntuneApprovalRequests {
             @{Name = 'Message'; Expression = { $Message } }
         }
 
-        if ($AlertData) {
-            Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
-        }
+        Write-AlertTrace -cmdletName $MyInvocation.MyCommand -tenantFilter $TenantFilter -data $AlertData
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Alerts' -tenant $TenantFilter -message "Failed to check Intune multi-admin approval requests for $($TenantFilter): $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage

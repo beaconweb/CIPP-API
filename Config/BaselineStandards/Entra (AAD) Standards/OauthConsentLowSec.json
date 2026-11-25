@@ -3,7 +3,13 @@
   "label": "Allow users to consent to applications with low security risk (Prevent OAuth phishing. Lower impact, less secure)",
   "cat": "Entra (AAD) Standards",
   "tag": [
-    "IntegratedApps"
+    "IntegratedApps",
+    "CMMC (AC.L1-b.1.ii)",
+    "CMMC (AC.L2-3.1.2)",
+    "CMMC (CM.L2-3.4.9)",
+    "FedRAMP B-D (KSI-IAM-ELP)",
+    "NIST SP 800-171 (3.1.2)",
+    "NIST SP 800-171 (3.4.9)"
   ],
   "impact": "Medium Impact",
   "helpText": "Sets the default oauth consent level so users can consent to applications that have low risks. This standard conflicts with the \"Require admin consent for applications\" standard; only one of the two should be assigned per tenant.",
@@ -14,7 +20,7 @@
   "powershellEquivalent": "Update-MgPolicyAuthorizationPolicy",
   "recommendedBy": [],
   "requiredCapabilities": [],
-  "secureScoreImpact": 0,
+  "secureScoreImpact": 4,
   "compare": "subset",
   "variables": {},
   "expected": {
@@ -25,11 +31,16 @@
   "read": {
     "cacheType": "AuthorizationPolicy"
   },
+  "writeTarget": "authorizationPolicy",
+  "writeTargetProperties": {
+    "permissionGrantPolicyIdsAssignedToDefaultUserRole": ["ManagePermissionGrantsForSelf.microsoft-user-default-low"]
+  },
   "remediate": {
     "executor": "GraphRequest",
     "requests": [
       {
         "method": "PATCH",
+        "asApp": false,
         "uri": "policies/authorizationPolicy/authorizationPolicy",
         "body": {
           "permissionGrantPolicyIdsAssignedToDefaultUserRole": [
@@ -39,6 +50,7 @@
       },
       {
         "method": "POST",
+        "asApp": false,
         "uri": "servicePrincipals(appId='00000003-0000-0000-c000-000000000000')/delegatedPermissionClassifications",
         "body": {
           "permissionName": "offline_access",
@@ -48,6 +60,7 @@
       },
       {
         "method": "POST",
+        "asApp": false,
         "uri": "servicePrincipals(appId='00000003-0000-0000-c000-000000000000')/delegatedPermissionClassifications",
         "body": {
           "permissionName": "openid",
@@ -57,6 +70,7 @@
       },
       {
         "method": "POST",
+        "asApp": false,
         "uri": "servicePrincipals(appId='00000003-0000-0000-c000-000000000000')/delegatedPermissionClassifications",
         "body": {
           "permissionName": "User.Read",
@@ -66,6 +80,7 @@
       },
       {
         "method": "POST",
+        "asApp": false,
         "uri": "servicePrincipals(appId='00000003-0000-0000-c000-000000000000')/delegatedPermissionClassifications",
         "body": {
           "permissionName": "profile",
@@ -75,6 +90,7 @@
       },
       {
         "method": "POST",
+        "asApp": false,
         "uri": "servicePrincipals(appId='00000003-0000-0000-c000-000000000000')/delegatedPermissionClassifications",
         "body": {
           "permissionName": "email",

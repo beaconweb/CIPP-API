@@ -16,8 +16,6 @@ function Push-DomainAnalyserTenant {
             Write-LogMessage -API 'DomainAnalyser' -tenant $Tenant.defaultDomainName -tenantid $Tenant.customerId -message "Cleaning up $CleanupCount domain(s) for excluded tenant" -sev Info
             Remove-CIPPAzDataTableEntity -Force @DomainTable -Entity $CleanupRows
         }
-    } elseif ($Tenant.GraphErrorCount -gt 50) {
-        return
     } else {
         try {
             # Get domains from cached database instead of making Graph API calls
@@ -28,21 +26,7 @@ function Push-DomainAnalyserTenant {
                 return
             }
 
-            # Remove domains that are not wanted, and used for cloud signature services. Same exclusions also found in Invoke-CIPPStandardAddDKIM
-            $ExclusionDomains = @(
-                '*.microsoftonline.com'
-                '*.mail.onmicrosoft.com'
-                '*.exclaimer.cloud'
-                '*.excl.cloud'
-                '*.codetwo.online'
-                '*.call2teams.com'
-                '*.signature365.net'
-                '*.myteamsconnect.io'
-                '*.teams.dstny.com'
-                '*.msteams.8x8.com'
-                '*.ucconnect.co.uk'
-                '*.teams-sbc.dk'
-            )
+            $ExclusionDomains = Get-CIPPDomainExclusionList
             $Domains = $Domains | Where-Object { $_.isVerified -eq $true } | ForEach-Object {
                 $Domain = $_
                 foreach ($ExclusionDomain in $ExclusionDomains) {
@@ -70,6 +54,21 @@ function Push-DomainAnalyserTenant {
             }
 
             $DomainCount = ($TenantDomains | Measure-Object).Count
+
+            # Before the count check, so a tenant left with no analysable domains is cleaned up too
+            try {
+                # Ordinal, like table keys: a row whose key differs only in case is replaced by the save below
+                $CurrentDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                foreach ($TenantDomain in $TenantDomains) { [void]$CurrentDomains.Add($TenantDomain.Domain) }
+                $StaleRows = @(Get-CIPPAzDataTableEntity @DomainTable -Filter ("PartitionKey eq 'TenantDomains' and TenantGUID eq '{0}'" -f $Tenant.customerId) -Property PartitionKey, RowKey).Where({ -not $CurrentDomains.Contains($_.RowKey) })
+                if ($StaleRows.Count -gt 0) {
+                    Remove-CIPPAzDataTableEntity -Force @DomainTable -Entity $StaleRows
+                    Write-LogMessage -Tenant $Tenant.defaultDomainName -TenantId $Tenant.customerId -API 'DomainAnalyser' -message "Removed $($StaleRows.Count) domain(s) no longer in the tenant: $($StaleRows.RowKey -join ', ')" -sev Info
+                }
+            } catch {
+                Write-LogMessage -Tenant $Tenant.defaultDomainName -TenantId $Tenant.customerId -API 'DomainAnalyser' -message 'Domain Analyser stale domain cleanup error' -sev 'Error' -LogData (Get-CippException -Exception $_)
+            }
+
             if ($DomainCount -gt 0) {
                 Write-Host "############# $DomainCount tenant Domains"
                 $TenantDomainObjects = [System.Collections.Generic.List[object]]::new()
@@ -109,8 +108,10 @@ function Push-DomainAnalyserTenant {
                                 $Domain.MailProviders = $OldDomain.MailProviders
                             }
                             # Fix tenant info in the event of a default domain name change in a tenant
-                            $Domain | Add-Member -MemberType NoteProperty -Name 'TenantId' -Value $TenantDomain.Tenant -Force
-                            $Domain | Add-Member -MemberType NoteProperty -Name 'TenantGUID' -Value $TenantDomain.TenantGUID -Force
+                            $Domain | Add-Member -NotePropertyMembers ([ordered]@{
+                                    TenantId   = $TenantDomain.Tenant
+                                    TenantGUID = $TenantDomain.TenantGUID
+                                }) -Force
                         }
                         # Return domain object to list
                         $TenantDomainObjects.Add($Domain)

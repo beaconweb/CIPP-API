@@ -14,7 +14,8 @@ function Invoke-EditTenantOffboardingDefaults {
 
     # Interact with query parameters or the body of the request.
     $customerId = $Request.Body.customerId
-    $defaultDomainName = $Request.Body.defaultDomainName
+    # Older rows are keyed by domain; take it from the tenant, never the body, so a clear cannot reach another tenant's row
+    $defaultDomainName = @(Get-Tenants -TenantFilter $customerId -IncludeErrors)[0].defaultDomainName
     $offboardingDefaults = $Request.Body.offboardingDefaults
 
     if (!$customerId) {
@@ -27,6 +28,15 @@ function Invoke-EditTenantOffboardingDefaults {
                 Body       = $response
             })
         return
+    }
+
+    # AnyTenant: enforce tenant scope here; Get-Tenants is narrowed to the caller's allowed tenants
+    $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+    if ($AllowedTenants -notcontains 'AllTenants' -and -not (Get-Tenants -TenantFilter $customerId)) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = @{ state = 'error'; resultText = 'Access to this tenant is not allowed' }
+            })
     }
 
     $PropertiesTable = Get-CippTable -TableName 'TenantProperties'

@@ -6,7 +6,7 @@ BeforeAll {
     $ReportPath = Join-Path $RepoRoot 'Modules/CIPPCore/Public/Get-CIPPSharedMailboxAccountEnabledReport.ps1'
 
     # Minimal stubs so Mock has commands to replace during tests
-    function Get-CIPPDbItem { param($TenantFilter, $Type) }
+    function Get-CIPPDbItem { param($TenantFilter, $Type, [switch]$ByTenant) }
     function Get-Tenants { param([switch]$IncludeErrors) }
     function Write-LogMessage { param($API, $tenant, $message, $sev) }
 
@@ -39,6 +39,7 @@ Describe 'Get-CIPPSharedMailboxAccountEnabledReport' {
             assignedLicenses      = @(@{ skuId = 'sku-1' })
             id                    = 'user-id-shared'
             onPremisesSyncEnabled = $false
+            signInActivity        = @{ lastSuccessfulSignInDateTime = '2026-10-01T08:00:00Z' }
         }
         $script:RegularUser = @{
             userPrincipalName     = 'user@contoso.com'
@@ -78,6 +79,7 @@ Describe 'Get-CIPPSharedMailboxAccountEnabledReport' {
         $Result[0].accountEnabled | Should -BeTrue
         $Result[0].onPremisesSyncEnabled | Should -BeFalse
         $Result[0].CacheTimestamp | Should -Not -BeNullOrEmpty
+        $Result[0].lastSuccessfulSignInDateTime | Should -Not -BeNullOrEmpty
         # Must not leak the regular (non-shared) mailbox
         $Result.UserPrincipalName | Should -Not -Contain 'user@contoso.com'
     }
@@ -130,6 +132,9 @@ Describe 'Get-CIPPSharedMailboxAccountEnabledReport' {
         }
         Mock -CommandName Get-CIPPDbItem -ParameterFilter { $Type -eq 'Users' } -MockWith {
             @(New-DbItem -PartitionKey $script:Tenant -RowKey 'u1' -Data $script:EnabledUser -Timestamp $script:Now)
+        }
+        Mock -CommandName Get-CIPPDbItem -ParameterFilter { $Type -eq 'Mailboxes' -and $ByTenant } -MockWith {
+            [ordered]@{ $script:Tenant = @(New-DbItem -PartitionKey $script:Tenant -RowKey '1' -Data $script:SharedMailbox -Timestamp $script:Now) }
         }
 
         $Result = Get-CIPPSharedMailboxAccountEnabledReport -TenantFilter 'AllTenants'

@@ -10,6 +10,7 @@ function Import-CommunityTemplate {
         $MigrationTable,
         $LocationData,
         $Source,
+        $Path,
         [switch]$Force
     )
 
@@ -19,7 +20,8 @@ function Import-CommunityTemplate {
     try {
         if ($Template.RowKey) {
             Write-Host "This is going to be a direct write to table, it's a CIPP template. We're writing $($Template.RowKey)"
-            $Template = $Template | Select-Object * -ExcludeProperty Timestamp
+            # LinkedTemplates is the repo file's manifest of the templates it links, not a table column
+            $Template = $Template | Select-Object * -ExcludeProperty Timestamp, LinkedTemplates
 
             # Support both objects and json string in repo (support pretty printed json in repo)
             if (Test-Json $Template.JSON -ErrorAction SilentlyContinue) {
@@ -29,7 +31,7 @@ function Import-CommunityTemplate {
             }
 
             # Check for existing object
-            $Existing = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$($Template.RowKey)' and PartitionKey eq '$($Template.PartitionKey)'" -ErrorAction SilentlyContinue
+            $Existing = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $Template.RowKey)' and PartitionKey eq '$(ConvertTo-CIPPODataFilterValue -Value $Template.PartitionKey)'" -ErrorAction SilentlyContinue
 
             if ($Existing) {
                 # This write is a full replace keyed on RowKey, so an unchanged repo file would
@@ -57,8 +59,27 @@ function Import-CommunityTemplate {
                     # Extract existing tenantFilter and excludedTenants
                     $tenantFilter = $ExistingJSON.tenantFilter
                     $excludedTenants = $ExistingJSON.excludedTenants
-                    $NewJSON.tenantFilter = $tenantFilter
-                    $NewJSON.excludedTenants = $excludedTenants
+                    $NewJSON | Add-Member -NotePropertyName tenantFilter -NotePropertyValue $tenantFilter -Force
+                    $NewJSON | Add-Member -NotePropertyName excludedTenants -NotePropertyValue $excludedTenants -Force
+                }
+            }
+
+            if ($Template.PartitionKey -eq 'StandardsTemplateV2') {
+                # Assigned standards templates run on a schedule, so assigning tenants needs the standards permission ($null = scheduled sync)
+                $CallerPermissions = Get-CippRequestAllowedPermissions
+                $Assigned = @($NewJSON.tenantFilter | Where-Object { "$($_.value ?? $_)" -notin @('', 'Template Tenant') })
+                if ($null -ne $CallerPermissions -and $CallerPermissions -notcontains 'Tenant.Standards.ReadWrite' -and $Assigned.Count -gt 0) {
+                    if ($Existing) {
+                        throw [System.UnauthorizedAccessException]::new("Your role can't update standards template '$($Template.RowKey)', because it is assigned to tenants and you don't have Tenant.Standards.ReadWrite.")
+                    }
+                    $NewJSON | Add-Member -NotePropertyName tenantFilter -NotePropertyValue @(@{ label = 'Template Tenant'; value = 'Template Tenant' }) -Force
+                    $NewJSON | Add-Member -NotePropertyName excludedTenants -NotePropertyValue @() -Force
+                }
+
+                # The row keeps either the file's tenants or the existing row's, so a restricted caller needs all of them in scope
+                $OutOfScope = @(Get-CIPPBaselineOutOfScopeAssignment -Assignments @($NewJSON.tenantFilter) | Select-Object -Unique)
+                if ($OutOfScope.Count -gt 0) {
+                    throw [System.UnauthorizedAccessException]::new("Your role can't import this template, because it is assigned to tenants outside your access: $($OutOfScope -join ', ').")
                 }
             }
 
@@ -82,6 +103,12 @@ function Import-CommunityTemplate {
             $Template.JSON = $NewJSON
             $Template | Add-Member -MemberType NoteProperty -Name SHA -Value $SHA -Force
             $Template | Add-Member -MemberType NoteProperty -Name Source -Value $Source -Force
+            if ($Path) {
+                $Template | Add-Member -MemberType NoteProperty -Name SourcePath -Value $Path -Force
+            }
+            if ($Template.PartitionKey -eq 'StandardsTemplateV2') {
+                $Template | Add-Member -MemberType NoteProperty -Name ContentHash -Value (Get-CIPPTemplateContentHash -JSON $NewJSON) -Force
+            }
             Add-CIPPAzDataTableEntity @Table -Entity $Template -Force
 
             if ($Existing -and $Existing.SHA -ne $SHA) {
@@ -150,6 +177,9 @@ function Import-CommunityTemplate {
                         RowKey       = if ($Duplicate) { $Duplicate.RowKey } else { $id }
                         Source       = $Source
                     }
+                    if ($Path) { $entity.SourcePath = $Path }
+                    # Full replace: keep the CIPP-assigned Package.
+                    if ($Duplicate -and $Duplicate.Package) { $entity.Package = $Duplicate.Package }
                     Add-CIPPAzDataTableEntity @Table -Entity $entity -Force
                     break
                 }
@@ -222,6 +252,9 @@ function Import-CommunityTemplate {
                         RowKey       = if ($Duplicate) { $Duplicate.RowKey } else { $id }
                         Source       = $Source
                     }
+                    if ($Path) { $entity.SourcePath = $Path }
+                    # Full replace: keep the CIPP-assigned Package.
+                    if ($Duplicate -and $Duplicate.Package) { $entity.Package = $Duplicate.Package }
                     Write-Information "Final entity: $($entity | ConvertTo-Json -Depth 10)"
 
                     Add-CIPPAzDataTableEntity @Table -Entity $entity -Force
@@ -258,6 +291,13 @@ function Import-CommunityTemplate {
 
                     #create a new template
                     $DisplayName = $Template.displayName ?? $template.Name
+
+                    $Validation = Test-CIPPIntuneTemplate -RawJSON $RawJson -TemplateType $URLName -DisplayName $DisplayName
+                    if (-not $Validation.IsValid) {
+                        $StatusMessage = "Intune template '$DisplayName' from source '$Source' was not imported: $($Validation.Errors -join ' ')"
+                        Write-Warning $StatusMessage
+                        return $StatusMessage
+                    }
 
                     # Check for duplicate template
                     $DuplicateFilter = "PartitionKey eq 'IntuneTemplate'"
@@ -311,10 +351,7 @@ function Import-CommunityTemplate {
                         RowKey       = if ($Duplicate) { $Duplicate.RowKey } else { $id }
                         Source       = $Source
                     }
-
-                    if ($Existing -and $Existing.Package) {
-                        $entity.Package = $Existing.Package
-                    }
+                    if ($Path) { $entity.SourcePath = $Path }
 
                     if ($Duplicate -and $Duplicate.Package) {
                         $entity.Package = $Duplicate.Package
@@ -326,6 +363,7 @@ function Import-CommunityTemplate {
             }
         }
     } catch {
+        if ($_.Exception -is [System.UnauthorizedAccessException]) { throw }
         $StatusMessage = "Community template import failed. Error: $($_.Exception.Message)"
         Write-Warning $StatusMessage
         Write-Information $_.InvocationInfo.PositionMessage

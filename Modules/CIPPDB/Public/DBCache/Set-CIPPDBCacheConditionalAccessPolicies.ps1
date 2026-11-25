@@ -21,6 +21,13 @@ function Set-CIPPDBCacheConditionalAccessPolicies {
 
         if ($TestResult -eq $false) {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Tenant does not have Azure AD Premium license, skipping CA' -sev Debug
+            # A license skip is still a completed collection: record authoritative empty sets for
+            # the CA types this collector writes so collect-on-miss does not re-run it forever.
+            # SecurityDefaults is deliberately NOT emptied here - it applies exactly to tenants
+            # without Entra Premium and its ungated collector keeps that cache populated.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'ConditionalAccessPolicies' -Data @() -AddCount -ClearOnEmpty
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'NamedLocations' -Data @() -AddCount -ClearOnEmpty
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'AuthenticationStrengths' -Data @() -AddCount -ClearOnEmpty
             return
         }
 
@@ -36,6 +43,14 @@ function Set-CIPPDBCacheConditionalAccessPolicies {
             # tenant whose last policy was removed must not keep reporting yesterday's.
             Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'ConditionalAccessPolicies' -Data @($CAPolicies) -AddCount -ClearOnEmpty
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Cached $(@($CAPolicies).Count) CA policies" -sev Debug
+            # The CA template baseline grades a security profile session control by name, read from this cache
+            if (@($CAPolicies).Where({ $_.sessionControls.globalSecureAccessFilteringProfile.profileId }).Count -gt 0) {
+                try {
+                    Set-CIPPDBCacheNetworkAccessFiltering -TenantFilter $TenantFilter
+                } catch {
+                    Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Failed to cache Global Secure Access filtering for CA policies: $($_.Exception.Message)" -sev Warning
+                }
+            }
             $CAPolicies = $null
         } catch {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Failed to cache CA policies: $($_.Exception.Message)" -sev Warning

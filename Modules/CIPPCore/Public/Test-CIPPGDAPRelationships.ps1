@@ -3,15 +3,20 @@ function Test-CIPPGDAPRelationships {
     param (
         $TenantFilter,
         $APIName = 'Access Check',
-        $Headers
+        $Headers,
+        [string]$PartnerTenantId
     )
+
+    if (!$PartnerTenantId) { $PartnerTenantId = $env:TenantID }
+    $IsPrimaryPartner = $PartnerTenantId -eq $env:TenantID
+    $PartnerLabel = if ($IsPrimaryPartner) { '*Partner Tenant' } else { "*Partner Tenant ($((Get-CIPPPartnerTenant -PartnerTenantId $PartnerTenantId).displayName ?? $PartnerTenantId))" }
 
     $GDAPissues = [System.Collections.Generic.List[object]]@()
     $MissingGroups = [System.Collections.Generic.List[object]]@()
     $RoleMappingResults = [System.Collections.Generic.List[object]]@()
     try {
         #Get graph request to list all relationships.
-        $Relationships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $env:TenantID -NoAuthCheck $true
+        $Relationships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $PartnerTenantId -NoAuthCheck $true
         #Group relationships by tenant. The tenant information is in $relationships.customer.TenantId.
         $RelationshipsByTenant = $Relationships | Group-Object -Property { $_.customer.TenantId }
         foreach ($Tenant in $RelationshipsByTenant) {
@@ -38,9 +43,9 @@ function Test-CIPPGDAPRelationships {
             }
 
         }
-        $me = (New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/me?$select=UserPrincipalName' -NoAuthCheck $true).UserPrincipalName
-        $CIPPGroupCount = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/`$count?`$filter=startsWith(displayName,'M365 GDAP')" -NoAuthCheck $true -ComplexFilter
-        $SAMUserMemberships = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/me/memberOf?$select=id,displayName,isAssignableToRole' -NoAuthCheck $true
+        $me = (New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/me?$select=UserPrincipalName' -tenantid $PartnerTenantId -NoAuthCheck $true).UserPrincipalName
+        $CIPPGroupCount = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/`$count?`$filter=startsWith(displayName,'M365 GDAP')" -tenantid $PartnerTenantId -NoAuthCheck $true -ComplexFilter
+        $SAMUserMemberships = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/me/memberOf?$select=id,displayName,isAssignableToRole' -tenantid $PartnerTenantId -NoAuthCheck $true
         $ExpectedGroups = @(
             'AdminAgents',
             'M365 GDAP Application Administrator',
@@ -63,7 +68,7 @@ function Test-CIPPGDAPRelationships {
         $NestedGroups = [System.Collections.Generic.List[object]]::new()
         foreach ($RoleGroup in $RoleAssignableGroups) {
             Write-Information "Getting nested group memberships for $($RoleGroup.displayName)"
-            $NestedGroups.AddRange(@(New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/$($RoleGroup.id)/memberOf?`$select=id,displayName" -NoAuthCheck $true))
+            $NestedGroups.AddRange(@(New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/$($RoleGroup.id)/memberOf?`$select=id,displayName" -tenantid $PartnerTenantId -NoAuthCheck $true))
         }
         foreach ($ExpectedGroup in $ExpectedGroups) {
             $GroupFound = $false
@@ -78,7 +83,7 @@ function Test-CIPPGDAPRelationships {
                 $GDAPissues.add([PSCustomObject]@{
                         Type         = $Type
                         Issue        = "$($ExpectedGroup) is not assigned to the SAM user $me. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
-                        Tenant       = '*Partner Tenant'
+                        Tenant       = $PartnerLabel
                         Relationship = 'None'
                         Link         = 'https://docs.cipp.app/setup/maintaining-cipp/recommended-roles'
 
@@ -93,10 +98,44 @@ function Test-CIPPGDAPRelationships {
             $GDAPissues.add([PSCustomObject]@{
                     Type         = 'Warning'
                     Issue        = "We only found $($CIPPGroupCount) of the 15 required groups. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
-                    Tenant       = '*Partner Tenant'
+                    Tenant       = $PartnerLabel
                     Relationship = 'None'
                     Link         = 'https://docs.cipp.app/setup/maintaining-cipp/recommended-roles'
 
+                }) | Out-Null
+        }
+
+        # GDAP invites/onboarding call the Partner Center API with delegated auth, so obtain a token for that
+        # audience and confirm the user_impersonation scope is in it, the same way the access permissions check
+        # inspects the Graph token. The token request itself fails with AADSTS65001 when the scope was never
+        # consented for the SAM app in the partner tenant.
+        try {
+            $PartnerCenterToken = Get-GraphToken -tenantid $PartnerTenantId -scope 'https://api.partnercenter.microsoft.com/.default' -returnRefresh $true -SkipCache $true
+            $PartnerCenterTokenDetails = Read-JwtAccessDetails -Token $PartnerCenterToken.access_token
+            if ($PartnerCenterTokenDetails.Scope -notcontains 'user_impersonation') {
+                $GDAPissues.add([PSCustomObject]@{
+                        Type         = 'Error'
+                        Issue        = "The Partner Center API token for the SAM application does not contain the 'user_impersonation' scope. This permission is part of the CIPP defaults, so this usually indicates a wider problem with the SAM application's permissions. Run the Permissions check and repair permissions, then refresh this check. GDAP invites and tenant onboarding will fail until this is resolved."
+                        Tenant       = $PartnerLabel
+                        Relationship = 'None'
+                        Link         = 'https://docs.cipp.app/setup/installation/permissions'
+                    }) | Out-Null
+            }
+        } catch {
+            $ErrorMessage = Get-CippException -Exception $_
+            # The Partner Center consent is part of the CIPP defaults, so a missing grant rarely happens in
+            # isolation - a failure here usually points at a wider SAM application or token problem.
+            if ($ErrorMessage.NormalizedError -match 'AADSTS65001|consent') {
+                $Issue = "The Partner Center API 'user_impersonation' delegated permission is not consented for the SAM application. This permission is part of the CIPP defaults, so this usually indicates a wider problem with the SAM application's permissions. Run the Permissions check and repair permissions, then refresh this check. GDAP invites and tenant onboarding will fail until this is resolved."
+            } else {
+                $Issue = "Could not obtain a Partner Center API token: $($ErrorMessage.NormalizedError). This usually indicates a problem with the SAM application or its tokens rather than the Partner Center permission itself - run the Permissions check for details. GDAP invites and tenant onboarding will fail until this is resolved."
+            }
+            $GDAPissues.add([PSCustomObject]@{
+                    Type         = 'Error'
+                    Issue        = $Issue
+                    Tenant       = $PartnerLabel
+                    Relationship = 'None'
+                    Link         = 'https://docs.cipp.app/setup/installation/permissions'
                 }) | Out-Null
         }
 
@@ -105,9 +144,10 @@ function Test-CIPPGDAPRelationships {
         # Problems are added to GDAPIssues as errors (so they count toward the Errors total) and tagged with
         # Category 'RoleMapping' so the frontend can keep them out of the GDAP Issues table (the detail/repair view
         # lives in RoleMappingResults).
+        # Stored GDAP role mappings reference groups in the primary partner tenant only
         $RolesTable = Get-CIPPTable -TableName 'GDAPRoles'
         $StoredRoleMappings = Get-CIPPAzDataTableEntity @RolesTable -Filter "PartitionKey eq 'Roles'"
-        if (($StoredRoleMappings | Measure-Object).Count -gt 0) {
+        if ($IsPrimaryPartner -and ($StoredRoleMappings | Measure-Object).Count -gt 0) {
             # Read-only check: do not write back or recreate groups from the access check card
             $MappingCheck = Test-CIPPGDAPGroupMappings -RoleMappings $StoredRoleMappings -Headers $Headers
             $RoleMappingResults.AddRange(@($MappingCheck.Results))
@@ -117,7 +157,7 @@ function Test-CIPPGDAPRelationships {
                             Type         = 'Error'
                             Category     = 'RoleMapping'
                             Issue        = "The GDAP role mapping for '$($MappingResult.GroupName)' references a security group that no longer exists in the partner tenant. Onboarding group mapping will fail until the GDAP roles are recreated."
-                            Tenant       = '*Partner Tenant'
+                            Tenant       = $PartnerLabel
                             Relationship = 'None'
                             Link         = 'https://docs.cipp.app/setup/maintaining-cipp/recommended-roles'
                         }) | Out-Null
@@ -126,7 +166,7 @@ function Test-CIPPGDAPRelationships {
                             Type         = 'Error'
                             Category     = 'RoleMapping'
                             Issue        = "The GDAP role mapping for '$($MappingResult.GroupName)' points at a stale group id but a matching group still exists. Use 'Repair Role Mappings' under Details to correct the stored group id."
-                            Tenant       = '*Partner Tenant'
+                            Tenant       = $PartnerLabel
                             Relationship = 'None'
                             Link         = 'https://docs.cipp.app/setup/maintaining-cipp/recommended-roles'
                         }) | Out-Null
@@ -137,6 +177,14 @@ function Test-CIPPGDAPRelationships {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -headers $Headers -API $APINAME -message "Failed to run GDAP check for $($TenantFilter): $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+        # An aborted run must not read as a pass
+        $GDAPissues.add([PSCustomObject]@{
+                Type         = 'Error'
+                Issue        = "The GDAP check could not run for this partner tenant: $($ErrorMessage.NormalizedError)."
+                Tenant       = $PartnerLabel
+                Relationship = 'None'
+                Link         = 'https://docs.cipp.app/setup/installation/permissions'
+            }) | Out-Null
     }
 
     $GDAPRelationships = [PSCustomObject]@{
@@ -148,14 +196,15 @@ function Test-CIPPGDAPRelationships {
     }
 
     $Table = Get-CIPPTable -TableName AccessChecks
-    $Data = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'AccessCheck' and RowKey eq 'GDAPRelationships'"
+    $CacheRowKey = if ($IsPrimaryPartner) { 'GDAPRelationships' } else { "GDAPRelationships-$PartnerTenantId" }
+    $Data = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'AccessCheck' and RowKey eq '$CacheRowKey'"
 
     if ($Data) {
         $Data.Data = [string](ConvertTo-Json -InputObject $GDAPRelationships -Depth 10 -Compress)
     } else {
         $Data = @{
             PartitionKey = 'AccessCheck'
-            RowKey       = 'GDAPRelationships'
+            RowKey       = $CacheRowKey
             Data         = [string](ConvertTo-Json -InputObject $GDAPRelationships -Depth 10 -Compress)
         }
     }

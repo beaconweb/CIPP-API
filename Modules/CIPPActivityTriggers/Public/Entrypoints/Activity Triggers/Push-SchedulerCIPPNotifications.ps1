@@ -23,16 +23,26 @@ function Push-SchedulerCIPPNotifications {
 
     $LogTable = Get-CIPPTable
     $StandardsTable = Get-CIPPTable -tablename CippStandardsAlerts
-    $PartitionKey = Get-Date -UFormat '%Y%m%d'
+    $RunInstant = Get-Date
+    # Must match the Logbook partition zone in Write-LogMessage
+    $LogZone = [Environment]::GetEnvironmentVariable('CIPP_TIMEZONE')
+    if (-not $LogZone) { $LogZone = 'UTC' }
+    $LogToday = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($RunInstant.ToUniversalTime(), $LogZone)
+    $LogPartitions = $LogToday.ToString('yyyyMMdd'), $LogToday.AddDays(-1).ToString('yyyyMMdd')
+    $StandardsPartitions = $RunInstant.ToString('yyyyMMdd'), $RunInstant.AddDays(-1).ToString('yyyyMMdd')
 
     # Server-side: sentAsAlert + severity (small fixed set). API is filtered client-side
     # because the API list is open-ended and OR-expanding it can exceed the OData filter limit.
     $sevOr = ($severity | ForEach-Object { "Severity eq '$($_ -replace "'", "''")'" }) -join ' or '
-    $LogFilter = "PartitionKey eq '$PartitionKey' and sentAsAlert eq false and ($sevOr)"
-    $StandardsFilter = "PartitionKey eq '$PartitionKey' and sentAsAlert eq false"
 
-    $Currentlog = @(Get-CIPPAzDataTableEntity @LogTable -Filter $LogFilter | Where-Object { $_.API -in $Settings })
-    $CurrentStandardsLogs = @(Get-CIPPAzDataTableEntity @StandardsTable -Filter $StandardsFilter)
+    $Currentlog = @(foreach ($PartitionKey in $LogPartitions) {
+            foreach ($Row in Get-CIPPAzDataTableEntity @LogTable -Filter "PartitionKey eq '$PartitionKey' and sentAsAlert eq false and ($sevOr)") {
+                if ($Row.API -in $Settings) { $Row }
+            }
+        })
+    $CurrentStandardsLogs = @(foreach ($PartitionKey in $StandardsPartitions) {
+            Get-CIPPAzDataTableEntity @StandardsTable -Filter "PartitionKey eq '$PartitionKey' and sentAsAlert eq false"
+        })
 
     Write-Information "Alerts: $($Currentlog.Count) found"
     Write-Information "Standards: $($CurrentStandardsLogs.Count) found"
@@ -145,7 +155,9 @@ function Push-SchedulerCIPPNotifications {
                 $Data = $g.Group | Select-Object Message, API, Tenant, Username, Severity
                 $HTMLContent = New-CIPPAlertTemplate -Data $Data -Format 'psa' -InputObject 'table' -CIPPURL $CIPPURL
                 $Title = "$tenant CIPP Alert: Alerts found starting at $((Get-Date).AddMinutes(-15))"
-                Send-CIPPAlert -Type 'psa' -Title $Title -HTMLContent $HTMLContent.htmlcontent -TenantFilter $tenant -APIName 'Alerts'
+                # The visible title contains a timestamp, so use a stable per-tenant key for PSA
+                # consolidation. PSA integrations that ignore the optional key remain unchanged.
+                Send-CIPPAlert -Type 'psa' -Title $Title -HTMLContent $HTMLContent.htmlcontent -TenantFilter $tenant -APIName 'Alerts' -PSAConsolidationKey "$tenant|Alerts"
                 & $MarkSent $g.Group $LogTable
                 $Data = $null; $HTMLContent = $null
             }

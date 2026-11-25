@@ -48,10 +48,12 @@ function Invoke-ListCAtemplates {
                 templates     = @($packageTemplates | ForEach-Object {
                         try {
                             $data = $_.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
-                            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.GUID -Force
-                            $data | Add-Member -NotePropertyName 'package' -NotePropertyValue $_.Package -Force
-                            $data | Add-Member -NotePropertyName 'source' -NotePropertyValue $_.Source -Force
-                            $data | Add-Member -NotePropertyName 'isSynced' -NotePropertyValue (![string]::IsNullOrEmpty($_.SHA)) -Force
+                            $data | Add-Member -NotePropertyMembers ([ordered]@{
+                                    GUID     = $_.GUID
+                                    package  = $_.Package
+                                    source   = $_.Source
+                                    isSynced = (![string]::IsNullOrEmpty($_.SHA))
+                                }) -Force
                             $data
                         } catch {
                         }
@@ -60,7 +62,9 @@ function Invoke-ListCAtemplates {
         } | Sort-Object -Property label)
     } else {
         if ($GUID) {
-            $SafeGUID = ConvertTo-CIPPODataFilterValue -Value $GUID -Type Guid
+            # The GUID column is '<guid>.CATemplate.json' for the templates imported from Config above, so it
+            # is not always a bare GUID. Accept the value the list publishes and escape it like the other readers.
+            $SafeGUID = ConvertTo-CIPPODataFilterValue -Value $GUID -Type String
             $Filter = "PartitionKey eq 'CATemplate' and GUID eq '$SafeGUID'"
             $RawTemplates = (Get-CIPPAzDataTableEntity @Table -Filter $Filter)
         }
@@ -71,10 +75,12 @@ function Invoke-ListCAtemplates {
             try {
                 $row = $_
                 $data = $row.JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
-                $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $row.GUID -Force
-                $data | Add-Member -NotePropertyName 'source' -NotePropertyValue $row.Source -Force
-                $data | Add-Member -NotePropertyName 'isSynced' -NotePropertyValue (![string]::IsNullOrEmpty($row.SHA)) -Force
-                $data | Add-Member -NotePropertyName 'package' -NotePropertyValue $row.Package -Force
+                $data | Add-Member -NotePropertyMembers ([ordered]@{
+                        GUID     = $row.GUID
+                        source   = $row.Source
+                        isSynced = (![string]::IsNullOrEmpty($row.SHA))
+                        package  = $row.Package
+                    }) -Force
                 $data
             } catch {
                 Write-Warning "Failed to process CA template: $($row.RowKey) - $($_.Exception.Message)"

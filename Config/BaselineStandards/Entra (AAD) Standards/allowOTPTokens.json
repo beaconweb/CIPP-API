@@ -3,7 +3,9 @@
   "label": "Enable OTP via Authenticator",
   "cat": "Entra (AAD) Standards",
   "tag": [
-    "EIDSCA.AM02"
+    "EIDSCA.AM02",
+    "CMMC (IA.L2-3.5.3)",
+    "NIST SP 800-171 (3.5.3)"
   ],
   "impact": "Low Impact",
   "helpText": "Allows you to use MS authenticator OTP token generator",
@@ -40,6 +42,10 @@
       }
     ]
   },
+  "writeTarget": "authenticationMethodsPolicy",
+  "writeTargetProperties": {
+    "MicrosoftAuthenticator.isSoftwareOathEnabled": "%isSoftwareOathEnabled%"
+  },
   "remediate": {
     "executor": "GraphRequest",
     "requests": [
@@ -48,7 +54,6 @@
         "uri": "policies/authenticationMethodsPolicy/authenticationMethodConfigurations/microsoftAuthenticator",
         "body": {
           "@odata.type": "#microsoft.graph.microsoftAuthenticatorAuthenticationMethodConfiguration",
-          "state": "enabled",
           "isSoftwareOathEnabled": "%isSoftwareOathEnabled%"
         }
       }
